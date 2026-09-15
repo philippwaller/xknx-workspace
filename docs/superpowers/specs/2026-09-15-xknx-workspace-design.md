@@ -47,11 +47,19 @@ repository:
 
 ```text
 xknx-workspace/
+├── README.md
 ├── AGENTS.md
 ├── bootstrap
 ├── dev
-├── pyproject.toml
-├── uv.lock
+├── .workspace/
+│   ├── pyproject.toml
+│   ├── uv.lock
+│   ├── xknx_workspace.py
+│   └── tests/
+├── .agents/
+├── .github/
+├── docs/
+├── .xknx-dev.toml           # generated and ignored
 ├── .xknx-dev.example.toml
 ├── home-assistant-core/
 ├── home-assistant-frontend/
@@ -63,6 +71,13 @@ xknx-workspace/
 ├── xknxtoolkit/
 └── home-assistant.io/
 ```
+
+The root deliberately exposes only human entry points, workspace configuration,
+documentation, and the product checkouts. Internal CLI code, its Python
+environment definition, lockfile, and tests live under `.workspace/`.
+`bootstrap` and `dev` are thin wrappers around `.workspace/xknx_workspace.py`.
+Dependabot is configured to update the Python environment rooted at
+`/.workspace`.
 
 The two Home Assistant frontend checkouts have different purposes:
 
@@ -104,8 +119,8 @@ The Python standard library owns argument parsing, concurrency, subprocesses,
 paths, JSON, logging, and TOML reading. Rich is the only runtime dependency and
 is used solely for interactive terminal rendering. There is no Click, Typer,
 `mise`, workflow framework, or custom process manager. The first implementation
-may remain in one Python module and should be split only when an actual boundary
-becomes difficult to understand or test.
+remains in `.workspace/xknx_workspace.py` and should be split only when an actual
+boundary becomes difficult to understand or test.
 
 The public command surface is intentionally small:
 
