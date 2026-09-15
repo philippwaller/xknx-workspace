@@ -5,7 +5,7 @@ requires-python = ">=3.12"
 dependencies = ["rich>=14,<15"]
 
 [dependency-groups]
-dev = ["pytest>=8,<9"]
+dev = ["pytest>=9.1.1,<10"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
