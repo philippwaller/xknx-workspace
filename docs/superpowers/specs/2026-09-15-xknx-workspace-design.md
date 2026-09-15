@@ -284,12 +284,14 @@ The interactive presentation follows Docker Compose and BuildKit conventions:
  ○ Smoke test                  Waiting
 ```
 
-Each logical component owns one stable row. Only running components show a
-spinner, elapsed time, and one reusable indented substep line. Completed
-components collapse to short green result lines. Independent components may run
-concurrently up to `--jobs`, so the live display can show multiple active
-spinners without exposing their interleaved subprocess output. Full output is
-written to per-task logs under ignored `.state/logs/`.
+Each logical component owns one stable row with fixed-width component, result,
+and duration columns. Every result begins at the same horizontal position. Only
+running components show a spinner and elapsed time; their current substep
+replaces the text in the result column instead of creating an indented detail
+row. Completed components become short green result lines. Independent
+components may run concurrently up to `--jobs`, so the live display can show
+multiple active spinners without exposing their interleaved subprocess output.
+Full output is written to per-task logs under ignored `.state/logs/`.
 
 At the first non-zero task result, bootstrap records that task as the primary
 failure and schedules nothing new. Already running package operations finish
@@ -460,12 +462,12 @@ progress modes, configuration redaction, failure handling, and resumption. Shell
 launcher tests prove that a missing controller environment is synchronized from
 the lockfile before Python starts, while `./dev` never performs that sync.
 
-TTY tests verify a compact Rich plan without raw commands, stable component rows,
-multiple simultaneous spinners, collapsing success rows, and an actionable
-first-failure panel. Plain and JSON tests verify append-only output without a
-terminal. Prerequisite tests verify that missing global tools stop before
-project mutation and return the supported operating system's installation
-command or official link.
+TTY tests verify a compact Rich plan without raw commands, fixed result-column
+alignment, stable component rows, multiple simultaneous spinners, collapsing
+success rows, and an actionable first-failure panel. Plain and JSON tests verify
+append-only output without a terminal. Prerequisite tests verify that missing
+global tools stop before project mutation and return the supported operating
+system's installation command or official link.
 
 An integration test uses temporary local Git repositories and fake executables
 to exercise cloning, fetching, idempotency, parallel scheduling, logging, and
