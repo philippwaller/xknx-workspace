@@ -1462,7 +1462,8 @@ def render_plan(plan: Sequence[Mapping[str, object]], print_fn=print, *, secrets
             label = "Docker (optional): " if item.get("tool") == "docker" else ""
             print_fn(f"{str(item['level']).upper()}: {label}{item.get('message') or item.get('link', '')}")
         elif item.get("kind") == "manual":
-            print_fn(f"MANUAL: install {item['tool']} — {item['link']}")
+            tools = item.get("tools") or (item["tool"],)
+            print_fn(f"MANUAL: install {', '.join(tools)} — {item['link']}")
 
 
 def run_bootstrap(

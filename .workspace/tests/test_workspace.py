@@ -216,6 +216,15 @@ def test_missing_macos_prerequisites_are_guidance_not_jobs() -> None:
     }]
 
 
+def test_missing_package_source_guidance_renders_all_tools_and_link() -> None:
+    guidance = ws.prerequisite_guidance(
+        "macos", {"git": None, "uv": None}, package_source_available=False
+    )
+    lines: list[str] = []
+    ws.render_plan(guidance, lines.append)
+    assert lines == ["MANUAL: install git, uv — https://brew.sh/"]
+
+
 def test_missing_nvm_is_blocking_and_never_resolves_or_runs_an_installer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
