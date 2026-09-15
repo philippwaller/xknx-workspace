@@ -512,3 +512,34 @@ def test_reexec_rejects_a_new_unconfirmed_action(
 def test_main_accepts_the_public_command_surface(argv: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ws, "run_bootstrap", lambda *args, **kwargs: 0, raising=False)
     assert ws.main(argv) == 0
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        ({"on_default": True, "clean": True, "ahead": 0, "behind": 2, "diverged": False}, "fast-forward"),
+        ({"on_default": False, "clean": True, "ahead": 0, "behind": 2, "diverged": False}, "report-only"),
+        ({"on_default": True, "clean": False, "ahead": 0, "behind": 2, "diverged": False}, "report-only"),
+        ({"on_default": True, "clean": True, "ahead": 1, "behind": 0, "diverged": False}, "report-only"),
+        ({"on_default": True, "clean": True, "ahead": 1, "behind": 1, "diverged": True}, "report-only"),
+    ],
+)
+def test_update_decision_never_repairs_developer_git_state(
+    state: dict[str, object], expected: str
+) -> None:
+    assert ws.update_decision(state) == expected
+
+
+def test_repository_row_contains_the_complete_git_observation() -> None:
+    status = {
+        "path": "/workspace/xknx",
+        "branch": "feature/colors",
+        "default_branch": "trunk",
+        "dirty": True,
+        "ahead": 3,
+        "behind": 1,
+        "diverged": True,
+        "action": "unchanged",
+        "error": None,
+    }
+    assert ws.repository_row(status) == "! xknx  feature/colors  dirty  ↑3 ↓1  unchanged"

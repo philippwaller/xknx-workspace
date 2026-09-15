@@ -511,6 +511,152 @@ def repositories_for(profile: str) -> tuple[str, ...]:
         raise ValueError(f"unknown profile: {profile}") from error
 
 
+def update_decision(state: Mapping[str, object]) -> str:
+    return (
+        "fast-forward"
+        if state["on_default"]
+        and state["clean"]
+        and state["ahead"] == 0
+        and state["behind"] > 0
+        and not state["diverged"]
+        else "report-only"
+    )
+
+
+def _git(path: Path, runner, *args: str) -> subprocess.CompletedProcess[str]:
+    return runner(
+        ["git", "-C", str(path), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _git_output(path: Path, runner, *args: str) -> str:
+    result = _git(path, runner, *args)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or f"git {' '.join(args)} failed")
+    return result.stdout.strip()
+
+
+def repository_status(path: Path, runner=subprocess.run) -> dict[str, object]:
+    default_ref = _git_output(path, runner, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    branch_result = _git(path, runner, "symbolic-ref", "--short", "HEAD")
+    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else "HEAD"
+    dirty = bool(_git_output(path, runner, "status", "--porcelain=v1"))
+    ahead, behind = map(
+        int,
+        _git_output(
+            path,
+            runner,
+            "rev-list",
+            "--left-right",
+            "--count",
+            f"HEAD...{default_ref}",
+        ).split(),
+    )
+    default_branch = default_ref.removeprefix("origin/")
+    return {
+        "path": str(path),
+        "branch": branch,
+        "default_branch": default_branch,
+        "dirty": dirty,
+        "ahead": ahead,
+        "behind": behind,
+        "diverged": ahead > 0 and behind > 0,
+        "action": "fetched",
+        "error": None,
+    }
+
+
+def safe_update(path: Path, runner=subprocess.run) -> dict[str, object]:
+    try:
+        _git_output(path, runner, "fetch", "origin", "--prune")
+    except RuntimeError as error:
+        try:
+            status = repository_status(path, runner)
+        except RuntimeError:
+            return _empty_repository_status(path, str(error), "error")
+        status.update(action="error", error=str(error))
+        return status
+    status = repository_status(path, runner)
+    decision = update_decision(
+        {
+            **status,
+            "on_default": status["branch"] == status["default_branch"],
+            "clean": not status["dirty"],
+        }
+    )
+    if decision == "fast-forward":
+        ancestor = _git(path, runner, "merge-base", "--is-ancestor", "HEAD", "refs/remotes/origin/HEAD")
+        if ancestor.returncode == 0:
+            _git_output(path, runner, "merge", "--ff-only", "refs/remotes/origin/HEAD")
+            status = repository_status(path, runner)
+            status["action"] = "fast-forwarded"
+            return status
+    status["action"] = "unchanged" if decision == "report-only" else "fetched"
+    return status
+
+
+def _empty_repository_status(
+    path: Path, error: str, action: str = "conflict"
+) -> dict[str, object]:
+    return {
+        "path": str(path),
+        "branch": None,
+        "default_branch": None,
+        "dirty": None,
+        "ahead": None,
+        "behind": None,
+        "diverged": None,
+        "action": action,
+        "error": error,
+    }
+
+
+def ensure_repository(path: Path, origin: str, runner=subprocess.run) -> dict[str, object]:
+    if path.exists():
+        top_level = _git(path, runner, "rev-parse", "--show-toplevel")
+        if top_level.returncode or Path(top_level.stdout.strip()).resolve() != path.resolve():
+            return _empty_repository_status(path, "existing path is not a Git repository")
+        actual_origin = _git(path, runner, "remote", "get-url", "origin")
+        if actual_origin.returncode or actual_origin.stdout.strip() != origin:
+            return _empty_repository_status(path, "existing repository origin differs from catalog")
+        return safe_update(path, runner)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    clone = runner(
+        ["git", "clone", origin, str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if clone.returncode:
+        return _empty_repository_status(
+            path, clone.stderr.strip() or "git clone failed", "error"
+        )
+    if path.name == "knx-frontend" and not (path / "homeassistant-frontend" / ".git").exists():
+        try:
+            _git_output(path, runner, "submodule", "update", "--init", "homeassistant-frontend")
+        except RuntimeError as error:
+            status = repository_status(path, runner)
+            status.update(action="error", error=str(error))
+            return status
+    status = repository_status(path, runner)
+    status["action"] = "cloned"
+    return status
+
+
+def repository_row(status: Mapping[str, object]) -> str:
+    name = Path(str(status["path"])).name
+    dirty = "dirty" if status["dirty"] else "clean"
+    marker = "✔" if status["action"] in {"cloned", "fetched", "fast-forwarded"} else "!"
+    return (
+        f"{marker} {name}  {status['branch']}  {dirty}  "
+        f"↑{status['ahead']} ↓{status['behind']}  {status['action']}"
+    )
+
+
 def load_settings(root: Path = ROOT, environ: Mapping[str, str] = os.environ) -> dict[str, object]:
     settings = {"profile": DEFAULTS["profile"], "home_assistant": dict(DEFAULTS["home_assistant"]), "knx": dict(DEFAULTS["knx"])}
     path = root / ".xknx-dev.toml"
