@@ -110,8 +110,8 @@ Profiles are fixed in code and additive:
 
 The workspace has two layers:
 
-1. A small POSIX shell entry point detects the operating system and ensures the
-   minimum prerequisites needed to launch the workspace CLI.
+1. A small POSIX shell entry point validates Python and `uv`, synchronizes the
+   locked local CLI environment when necessary, and launches the workspace CLI.
 2. A small Python CLI performs planning, setup, status collection, Git updates,
    smoke tests, and tmux orchestration.
 
@@ -141,35 +141,44 @@ status` includes diagnostics instead of introducing a separate doctor command.
 Supported systems are macOS, Ubuntu, Debian, and Ubuntu/Debian under WSL 2.
 The bootstrap detects the platform before constructing an installation plan.
 
-An existing Python 3.12+ is required to launch the read-only planning code. The
-launchers directly select the existing root CLI environment or a compatible
-system Python and never synchronize environments before confirmation or
-download Python. Without Rich, a fresh first run keeps complete plain progress.
-A missing root CLI environment is created through a displayed locked sync
-after the normal confirmation; later runs automatically use its Rich renderer.
-Daily commands never synchronize the environment, and existing ones are kept.
+The global developer toolchain is a prerequisite, not a bootstrap product:
 
-Git >= 2.39.0, `uv` >= 0.8.17, and `tmux` >= 3.2 are checked before project setup. Missing tools are
-installed automatically only when a supported package source exists for the
-current operating system. Homebrew is used on macOS and APT on Ubuntu, Debian,
-and supported WSL distributions. The exact command appears in the plan and the
-log before execution.
+- Git >= 2.39;
+- Python >= 3.12;
+- `uv` >= 0.8.17;
+- `tmux` >= 3.2;
+- NVM, with no workspace-wide exact version constraint.
 
-NVM is the sole package-source exception. When NVM is missing, the bootstrap
-resolves the current stable release from the official `nvm-sh/nvm` GitHub
-releases, constructs the versioned official installer URL, displays the full
-command, records the resolved version, and installs it after the normal plan
-confirmation. It never executes `master` or `HEAD` as the installer source.
+Bootstrap never installs, upgrades, or downgrades these tools. A missing or
+incompatible tool stops setup before any project checkout, configuration, or
+dependency wiring changes. The diagnostic gives the native one-shot package
+manager command for macOS, Ubuntu, Debian, or WSL when the tool is available
+from that platform's package source. Otherwise it links to the tool's official
+installation instructions. Existing newer versions are reported and retained.
+There is no `--enforce-tool-versions` option.
 
-Existing tools are not replaced automatically:
+Rich is project-owned rather than global. On `./bootstrap`, the shell launcher
+uses the prerequisite Python and `uv` to synchronize `.workspace/.venv` from
+`.workspace/uv.lock` with `--locked`, `--no-dev`, and
+`--no-python-downloads`, then starts the Python CLI from that environment. This
+small controller-environment preparation is the only mutation permitted before
+the plan confirmation. It cannot clone repositories, write `.xknx-dev.toml`,
+or modify project environments. A concise native preloader message may appear
+while Rich itself is being installed; the first interactive bootstrap screen
+is always Rich. If preparation fails, the launcher exits with the `uv` error
+and an actionable retry without entering bootstrap.
 
-- A compatible installed version is retained.
-- An older or newer version is reported with the workspace expectation.
-- A version below a required minimum blocks only dependent setup work.
-- `--enforce-tool-versions` explicitly aligns tools for which the workspace has
-  an exact expectation, including an intentional upgrade or downgrade.
-- Git, `tmux`, and package-managed `uv` use minimum versions rather than exact
-  cross-platform pins.
+Daily `./dev` commands never synchronize the controller environment. If it is
+missing or invalid, they direct the developer to run `./bootstrap`. Dependabot
+updates Rich through the normal `.workspace` manifest and lockfile; no floating
+`uv run --with` dependency is used.
+
+Node, Yarn, Corepack, npm, Python virtual environments, and project dependencies
+remain project-owned. NVM selects and, when needed, installs the Node version
+declared by each repository's `.nvmrc`. The `docs` and `all` profiles additionally
+require the Ruby version declared by each docs repository and Bundler; missing
+profile-specific prerequisites block only those profiles and are not installed
+by the workspace.
 
 Docker is inspected but never installed automatically. A missing installation
 produces an operating-system-specific installation link and marks optional
@@ -211,15 +220,18 @@ effective non-secret configuration and actionable conflicts.
 
 ## Bootstrap Plan and Execution
 
-Before mutation, bootstrap displays one complete plan containing:
+After preparing its own locked Rich environment, but before any project
+mutation, bootstrap displays a compact plan containing:
 
-- detected platform and selected profile;
-- missing tools and exact installation commands;
-- repositories to clone or inspect;
-- project setup scripts to execute;
-- editable dependency wiring;
-- configuration files and links to create;
-- unavailable optional services.
+- workspace name, detected platform, and selected profile;
+- a concise prerequisite result for each required tool;
+- repositories and project setup groups;
+- local configuration and editable dependency wiring;
+- warnings and unavailable optional services.
+
+The default view describes intent and current state; it does not print complete
+shell commands. `--verbose` adds the exact commands. The large plan table is not
+retained during execution.
 
 Interactive execution asks once for confirmation. `--yes` accepts the displayed
 plan for non-interactive onboarding. `--progress plain` is used automatically
@@ -272,9 +284,20 @@ The interactive presentation follows Docker Compose and BuildKit conventions:
  ○ Smoke test                  Waiting
 ```
 
-Each top-level task owns one stable row. A running task has one reusable detail
-row; completed tasks collapse to a single summary. Full subprocess output is
+Each logical component owns one stable row. Only running components show a
+spinner, elapsed time, and one reusable indented substep line. Completed
+components collapse to short green result lines. Independent components may run
+concurrently up to `--jobs`, so the live display can show multiple active
+spinners without exposing their interleaved subprocess output. Full output is
 written to per-task logs under ignored `.state/logs/`.
+
+At the first non-zero task result, bootstrap records that task as the primary
+failure and schedules nothing new. Already running package operations finish
+normally to avoid corrupting writes; waiting and dependent work becomes
+`skipped`. The final error panel leads with the component, failed substep, exit
+code, log path, and exact bootstrap retry command. A successful summary leads
+with the selected profile, next `./dev start` command, tmux session, and known
+local URLs.
 
 Supported modes mirror Docker terminology:
 
@@ -284,8 +307,9 @@ Supported modes mirror Docker terminology:
 - `--progress json`: JSON Lines events for agents and other tools.
 - `--progress quiet`: errors and final summary only.
 
-Verbose mode adds full subprocess output to plain output while preserving the
-per-task logs.
+Verbose mode reveals full commands and adds subprocess output to plain output
+while preserving the per-task logs. Interactive subprocess output remains in
+logs so the live layout stays readable.
 
 Each log records the working directory, redacted command, start time, duration,
 exit code, stdout, stderr, detected versions, and decisions. Logs never include
@@ -432,7 +456,16 @@ should run instead of starting hidden background processes.
 
 Pull requests run fast tests for platform and WSL detection, version comparison,
 profile selection, task dependencies, concurrency limits, Git state decisions,
-progress modes, configuration redaction, failure handling, and resumption.
+progress modes, configuration redaction, failure handling, and resumption. Shell
+launcher tests prove that a missing controller environment is synchronized from
+the lockfile before Python starts, while `./dev` never performs that sync.
+
+TTY tests verify a compact Rich plan without raw commands, stable component rows,
+multiple simultaneous spinners, collapsing success rows, and an actionable
+first-failure panel. Plain and JSON tests verify append-only output without a
+terminal. Prerequisite tests verify that missing global tools stop before
+project mutation and return the supported operating system's installation
+command or official link.
 
 An integration test uses temporary local Git repositories and fake executables
 to exercise cloning, fetching, idempotency, parallel scheduling, logging, and
@@ -459,12 +492,18 @@ automatic Git repair, or second CLI framework belongs in V1.
 
 ## Acceptance Criteria
 
-- A new contributor on each supported platform can see one complete plan and
-  bootstrap the default workspace with one confirmation.
+- A new contributor with the documented toolchain sees a Rich plan on the first
+  interactive run and can bootstrap the default workspace with one confirmation.
+- Bootstrap never installs or replaces global developer tools; missing
+  prerequisites fail before project mutation with actionable platform guidance.
+- The locked controller environment is the sole pre-confirmation mutation and
+  cannot modify configuration, repositories, or project environments.
 - A repeated bootstrap performs no unnecessary setup and safely resumes after a
   previous failure.
 - Independent setup tasks run with a default concurrency of three and stop
   scheduling new work after the first failure.
+- The default interactive view shows intent and live component state without raw
+  commands; `--verbose`, logs, plain mode, and JSON retain full transparency.
 - Existing repositories, branches, remotes, working-tree changes, and compatible
   tools are preserved.
 - Home Assistant imports all four local KNX packages from their root checkouts.
