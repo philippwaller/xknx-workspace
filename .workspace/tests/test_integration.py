@@ -1480,7 +1480,7 @@ def temporary_smoke_plan(tmp_path: Path, monkeypatch, body: str) -> dict:
 
 
 @pytest.mark.parametrize(("body", "expected"), [
-    ("from http.server import HTTPServer, BaseHTTPRequestHandler\nHTTPServer(('127.0.0.1', port), type('Handler', (BaseHTTPRequestHandler,), {'do_GET': lambda self: (self.send_response(401), self.end_headers())})).serve_forever()\n", 0),
+    ("from http.server import BaseHTTPRequestHandler\nfrom socketserver import TCPServer\nTCPServer(('127.0.0.1', port), type('Handler', (BaseHTTPRequestHandler,), {'do_GET': lambda self: (self.send_response(401), self.end_headers())})).serve_forever()\n", 0),
     ("raise SystemExit(7)\n", 7),
     ("signal.signal(signal.SIGINT, signal.SIG_IGN)\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(30)\n", 1),
 ])
@@ -1673,8 +1673,8 @@ def test_malformed_http_response_is_an_actionable_check_and_valid_status_json(tm
 
 def test_bootstrap_malformed_http_response_fails_and_reaps_child(tmp_path: Path, monkeypatch, capsys) -> None:
     plan = temporary_smoke_plan(tmp_path, monkeypatch,
-        "from http.server import HTTPServer, BaseHTTPRequestHandler\n"
-        f"HTTPServer(('127.0.0.1', port), type('Handler', (BaseHTTPRequestHandler,), {{'do_GET': lambda self: (Path({str(tmp_path / 'bad-http-served')!r}).touch(), self.wfile.write(b'NOT HTTP\\r\\n\\r\\n'))}})).serve_forever()\n",
+        "from http.server import BaseHTTPRequestHandler\nfrom socketserver import TCPServer\n"
+        f"TCPServer(('127.0.0.1', port), type('Handler', (BaseHTTPRequestHandler,), {{'do_GET': lambda self: (Path({str(tmp_path / 'bad-http-served')!r}).touch(), self.wfile.write(b'NOT HTTP\\r\\n\\r\\n'))}})).serve_forever()\n",
     )
 
     async def smoke(plan, progress):
@@ -1815,7 +1815,10 @@ def test_failed_ha_recovery_python_http_server_is_not_reusable(tmp_path: Path, m
     hass.write_text("#!/bin/sh\nexit 7\n")
     hass.chmod(0o755)
     recovery = tmp_path / "recovery-shell"
-    recovery.write_text(f"#!{sys.executable}\nimport os, sys\nos.execv(sys.executable, [sys.executable, '-m', 'http.server', '{port}', '--bind', '127.0.0.1'])\n")
+    recovery.write_text(
+        f"#!{sys.executable}\nfrom http.server import BaseHTTPRequestHandler\nfrom socketserver import TCPServer\n"
+        f"TCPServer(('127.0.0.1', {port}), type('Handler', (BaseHTTPRequestHandler,), {{'do_GET': lambda self: (self.send_response(200), self.end_headers())}})).serve_forever()\n"
+    )
     recovery.chmod(0o755)
     start = ws._tmux_process_shell(command, track_ha=True)
     child = subprocess.Popen(
