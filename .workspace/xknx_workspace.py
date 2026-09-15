@@ -213,7 +213,10 @@ class Progress:
         if status == "error" and (
             self.first_failure is None or duration is not None and not self.first_failure_complete
         ):
-            substep = f"{previous[1]} — " if previous and previous[0] == "running" else ""
+            if duration is not None and self.first_failure and self.first_failure[0] == task:
+                substep = f"{self.first_failure[1]} — "
+            else:
+                substep = f"{previous[1]} — " if previous and previous[0] == "running" else ""
             self.first_failure = (task, f"{substep}{detail}")
             self.first_failure_complete = duration is not None
         if self.mode == "tty":
@@ -224,7 +227,7 @@ class Progress:
                 self.mode = "plain"
         if self.mode == "json":
             print(json.dumps({"task": task, "status": status, "detail": detail}), flush=True)
-        elif self.mode != "quiet" or status in {"planned", "summary"} or (status == "error" and not self.first_error):
+        elif self.mode != "quiet" or status == "summary" or (status == "error" and not self.first_error):
             print(f"{task}: {status}: {detail}", flush=True)
         if status == "error":
             self.first_error = True
@@ -245,7 +248,8 @@ class Progress:
         }
         for task, (status, detail, duration) in self.rows.items():
             icon = Spinner("dots") if status == "running" else icons.get(status, Text("○", style="dim"))
-            table.add_row(icon, Text(task), Text(detail), Text(f"{duration:.1f}s" if duration is not None else ""))
+            displayed = detail.partition("; log: ")[0] if status in {"success", "error"} else detail
+            table.add_row(icon, Text(task), Text(displayed), Text(f"{duration:.1f}s" if duration is not None else ""))
         return table
 
     def _render_tty(self) -> None:
@@ -492,6 +496,12 @@ def repository_jobs(root: Path, repositories: Mapping[str, str]) -> list[Job]:
 async def run_tool_actions(actions, progress: Progress) -> list[Result]:
     results = []
     failed = False
+    manual_by_tool = {
+        tool: item
+        for item in actions
+        if item.get("kind") == "manual" and item.get("scope") != "docs"
+        for tool in item.get("tools") or (item.get("tool"),)
+    }
     for index, item in enumerate(actions):
         name = f"tool-{item.get('tool', index)}"
         if not item.get("blocking") or item.get("scope") == "docs":
@@ -500,11 +510,15 @@ async def run_tool_actions(actions, progress: Progress) -> list[Result]:
             results.append(Result(name, 1, 0, "skipped"))
             progress.emit(name, "skipped", "An earlier prerequisite failed")
             continue
-        tools = item.get("tools") or (item.get("tool"),)
-        if item.get("kind") == "tool":
-            detail = f"Requires {item['tool']} >= {item['minimum']}; installed {item.get('installed') or 'unavailable'}. Update it explicitly: {TOOL_LINKS[item['tool']]}"
+        guidance = manual_by_tool.get(item.get("tool")) if item.get("kind") == "tool" and item.get("installed") is None else None
+        reported = guidance or item
+        tools = reported.get("tools") or (reported.get("tool"),)
+        if reported.get("kind") == "tool" and reported.get("minimum"):
+            detail = f"Requires {reported['tool']} >= {reported['minimum']}; installed {reported.get('installed') or 'unavailable'}. Update it explicitly: {TOOL_LINKS[reported['tool']]}"
+        elif reported.get("kind") == "tool":
+            detail = f"Install {reported['tool']}: {reported.get('link') or TOOL_LINKS[reported['tool']]}"
         else:
-            detail = f"Install {', '.join(tools)}: {display_command(item['command'])}" if item.get("command") else f"Install {', '.join(tools)}: {item.get('link', '')}"
+            detail = f"Install with: {display_command(reported['command'])}" if reported.get("command") else f"Install {', '.join(tools)}: {reported.get('link', '')}"
         progress.emit(name, "error", detail)
         results.append(Result(name, 2, 0))
         failed = True
@@ -1510,6 +1524,7 @@ def render_plan(
     plan: Sequence[Mapping[str, object]], print_fn=print, *,
     secrets: set[str] | None = None, verbose: bool = False,
 ) -> None:
+    smoke_rendered = False
     for item in plan:
         kind = item.get("kind")
         if kind == "context":
@@ -1538,14 +1553,19 @@ def render_plan(
             print_fn(f"{str(item['level']).upper()}: {label}{item.get('message') or item.get('link', '')}")
         elif kind == "manual":
             tools = item.get("tools") or (item["tool"],)
-            print_fn(f"MANUAL: install {', '.join(tools)}" + (f" — {item['link']}" if item.get("link") else ""))
+            if item.get("command"):
+                print_fn(f"Install with: {display_command(item['command'], secrets)}")
+            else:
+                print_fn(f"Install {', '.join(tools)}: {item.get('link', '')}")
         elif kind == "wiring":
             print_fn("Wiring: install local packages into Home Assistant")
         elif kind == "smoke":
-            print_fn("Smoke test: verify Home Assistant imports and readiness")
+            if not smoke_rendered:
+                print_fn("Smoke test: verify Home Assistant imports and readiness")
+                smoke_rendered = True
             if lifecycle := item.get("lifecycle"):
                 print_fn(lifecycle)
-        if verbose and (command := item.get("command")):
+        if verbose and kind != "manual" and (command := item.get("command")):
             print_fn(f"{kind}: $ {display_command(command, secrets)}")
 
 

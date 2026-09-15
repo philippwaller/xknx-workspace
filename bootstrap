@@ -32,8 +32,17 @@ EOF
 }
 
 print_uv_guidance() {
+  printf '%s\n' 'uv 0.8.17 or newer is required; no environment was changed.' >&2
+  if [ -n "${1:-}" ]; then
+    printf '%s\n' "Found: $1" >&2
+  fi
   case $(uname -s) in
-    Darwin*) printf '%s\n' 'Install with: brew install uv' >&2 ;;
+    Darwin*)
+      if command -v brew >/dev/null 2>&1; then
+        printf '%s\n' 'Install with: brew install uv' >&2
+      else
+        printf '%s\n' 'Install uv: https://docs.astral.sh/uv/getting-started/installation/' >&2
+      fi ;;
     *) printf '%s\n' 'Install uv: https://docs.astral.sh/uv/getting-started/installation/' >&2 ;;
   esac
 }
@@ -52,12 +61,28 @@ if [ -z "$workspace_python" ] || ! "$workspace_python" -B -c 'import sys; sys.ex
   print_python_guidance
   exit 2
 fi
-if ! command -v uv >/dev/null 2>&1; then
+workspace_uv=$(command -v uv 2>/dev/null || :)
+if [ -z "$workspace_uv" ]; then
   print_uv_guidance
   exit 2
 fi
+workspace_uv_version=$("$workspace_uv" --version 2>/dev/null || :)
+if ! "$workspace_python" -B -c 'import re, sys; match = re.search(r"\d+(?:\.\d+)+", sys.argv[1]); raise SystemExit(not match or tuple(map(int, match.group().split("."))) < (0, 8, 17))' "$workspace_uv_version"; then
+  print_uv_guidance "$workspace_uv_version"
+  exit 2
+fi
 
-printf '%s\n' 'Preparing workspace UI…'
-uv sync --quiet --project "$root/.workspace" --locked --no-dev \
-  --no-python-downloads --python "$workspace_python"
+printf '%s\n' 'Preparing workspace UI…' >&2
+if "$workspace_uv" sync --quiet --project "$root/.workspace" --locked --no-dev \
+  --no-python-downloads --python "$workspace_python"; then
+  :
+else
+  workspace_sync_status=$?
+  printf '%s' 'Retry: ./bootstrap' >&2
+  for workspace_argument in "$@"; do
+    printf ' %s' "$workspace_argument" >&2
+  done
+  printf '\n' >&2
+  exit "$workspace_sync_status"
+fi
 exec "$controller_python" -B "$root/.workspace/xknx_workspace.py" bootstrap "$@"

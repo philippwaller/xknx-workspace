@@ -117,11 +117,14 @@ def test_first_bootstrap_syncs_locked_controller_before_exec(tmp_path: Path) -> 
     bin_dir.mkdir()
     (bin_dir / "dirname").symlink_to("/usr/bin/dirname")
     python3 = bin_dir / "python3"
-    python3.write_text("#!/bin/sh\ncase \"$*\" in *sys.version_info*) exit 0;; esac\nexit 90\n")
-    python3.chmod(0o755)
+    python3.symlink_to(sys.executable)
     uv = bin_dir / "uv"
     uv.write_text(
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + shlex.quote(str(tmp_path / "uv.args")) + "\n"
+        "#!/bin/sh\n"
+        "[ -z \"${UV_PROJECT_ENVIRONMENT:-}\" ] || exit 78\n"
+        "[ -z \"${VIRTUAL_ENV:-}\" ] || exit 79\n"
+        "if [ \"$1\" = --version ]; then printf 'uv 0.8.17\\n'; exit 0; fi\n"
+        "printf '%s\\n' \"$@\" > " + shlex.quote(str(tmp_path / "uv.args")) + "\n"
         "/bin/mkdir -p " + shlex.quote(str(tmp_path / ".workspace/.venv/bin")) + "\n"
         "printf '#!/bin/sh\\nprintf \"%%s\\\\n\" \"$@\"\\n' > "
         + shlex.quote(str(tmp_path / ".workspace/.venv/bin/python")) + "\n"
@@ -130,7 +133,11 @@ def test_first_bootstrap_syncs_locked_controller_before_exec(tmp_path: Path) -> 
     uv.chmod(0o755)
     result = subprocess.run(
         ["/bin/sh", str(tmp_path / "bootstrap"), "default"],
-        env={"PATH": str(bin_dir), "UV_PROJECT_ENVIRONMENT": str(tmp_path / "unrelated")},
+        env={
+            "PATH": str(bin_dir),
+            "UV_PROJECT_ENVIRONMENT": str(tmp_path / "unrelated"),
+            "VIRTUAL_ENV": str(tmp_path / "unrelated-venv"),
+        },
         capture_output=True, text=True, check=False,
     )
     expected = [
@@ -141,6 +148,135 @@ def test_first_bootstrap_syncs_locked_controller_before_exec(tmp_path: Path) -> 
     assert (tmp_path / "uv.args").read_text().splitlines() == expected
     assert result.stdout.splitlines()[-2:] == ["bootstrap", "default"]
     assert not (tmp_path / "unrelated").exists()
+    assert not (tmp_path / "unrelated-venv").exists()
+
+
+def test_bootstrap_json_progress_keeps_stdout_machine_readable(tmp_path: Path) -> None:
+    root = Path(ws.__file__).parents[1]
+    (tmp_path / "bootstrap").write_bytes((root / "bootstrap").read_bytes())
+    workspace = tmp_path / ".workspace"
+    workspace.mkdir()
+    (workspace / "xknx_workspace.py").write_text(
+        "import json\nprint(json.dumps({'task': 'bootstrap', 'status': 'summary', 'detail': 'ok'}))\n"
+    )
+    controller = workspace / ".venv/bin/python"
+    controller.parent.mkdir(parents=True)
+    controller.symlink_to(sys.executable)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "dirname").symlink_to("/usr/bin/dirname")
+    (bin_dir / "python3").symlink_to(sys.executable)
+    uv = bin_dir / "uv"
+    uv.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = --version ]; then printf 'uv 0.8.17\\n'; fi\n"
+    )
+    uv.chmod(0o755)
+
+    result = subprocess.run(
+        ["/bin/sh", str(tmp_path / "bootstrap"), "--progress", "json"],
+        env={"PATH": str(bin_dir)}, capture_output=True, text=True, check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert [json.loads(line) for line in result.stdout.splitlines()] == [
+        {"task": "bootstrap", "status": "summary", "detail": "ok"}
+    ]
+    assert "Preparing workspace UI" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("homebrew", "guidance"),
+    [
+        (False, "https://docs.astral.sh/uv/getting-started/installation/"),
+        (True, "Install with: brew install uv"),
+    ],
+)
+def test_missing_uv_on_macos_uses_only_available_install_guidance(
+    tmp_path: Path, homebrew: bool, guidance: str
+) -> None:
+    root = Path(ws.__file__).parents[1]
+    (tmp_path / "bootstrap").write_bytes((root / "bootstrap").read_bytes())
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "dirname").symlink_to("/usr/bin/dirname")
+    (bin_dir / "python3").symlink_to(sys.executable)
+    uname = bin_dir / "uname"
+    uname.write_text("#!/bin/sh\nprintf 'Darwin\\n'\n")
+    uname.chmod(0o755)
+    if homebrew:
+        brew = bin_dir / "brew"
+        brew.write_text(
+            "#!/bin/sh\nprintf called > " + shlex.quote(str(tmp_path / "brew-called")) + "\n"
+        )
+        brew.chmod(0o755)
+
+    result = subprocess.run(
+        ["/bin/sh", str(tmp_path / "bootstrap")], env={"PATH": str(bin_dir)},
+        capture_output=True, text=True, check=False,
+    )
+
+    assert result.returncode == 2
+    assert "uv 0.8.17 or newer is required" in result.stderr
+    assert guidance in result.stderr
+    assert ("brew install uv" in result.stderr) is homebrew
+    assert not (tmp_path / "brew-called").exists()
+
+
+def test_old_uv_is_rejected_before_sync_with_official_guidance(tmp_path: Path) -> None:
+    root = Path(ws.__file__).parents[1]
+    (tmp_path / "bootstrap").write_bytes((root / "bootstrap").read_bytes())
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "dirname").symlink_to("/usr/bin/dirname")
+    (bin_dir / "python3").symlink_to(sys.executable)
+    uname = bin_dir / "uname"
+    uname.write_text("#!/bin/sh\nprintf 'Linux\\n'\n")
+    uname.chmod(0o755)
+    uv = bin_dir / "uv"
+    uv.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = --version ]; then printf 'uv 0.8.16\\n'; exit 0; fi\n"
+        "printf called > " + shlex.quote(str(tmp_path / "sync-called")) + "\n"
+    )
+    uv.chmod(0o755)
+
+    result = subprocess.run(
+        ["/bin/sh", str(tmp_path / "bootstrap")], env={"PATH": str(bin_dir)},
+        capture_output=True, text=True, check=False,
+    )
+
+    assert result.returncode == 2
+    assert "uv 0.8.17 or newer is required" in result.stderr
+    assert "uv 0.8.16" in result.stderr
+    assert "https://docs.astral.sh/uv/getting-started/installation/" in result.stderr
+    assert not (tmp_path / "sync-called").exists()
+
+
+def test_uv_sync_failure_preserves_status_and_prints_retry(tmp_path: Path) -> None:
+    root = Path(ws.__file__).parents[1]
+    (tmp_path / "bootstrap").write_bytes((root / "bootstrap").read_bytes())
+    (tmp_path / ".workspace").mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "dirname").symlink_to("/usr/bin/dirname")
+    (bin_dir / "python3").symlink_to(sys.executable)
+    uv = bin_dir / "uv"
+    uv.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = --version ]; then printf 'uv 0.12.13\\n'; exit 0; fi\n"
+        "printf 'locked sync failed\\n' >&2\nexit 42\n"
+    )
+    uv.chmod(0o755)
+
+    result = subprocess.run(
+        ["/bin/sh", str(tmp_path / "bootstrap"), "default"],
+        env={"PATH": str(bin_dir)}, capture_output=True, text=True, check=False,
+    )
+
+    assert result.returncode == 42
+    assert "locked sync failed" in result.stderr
+    assert "Retry: ./bootstrap default" in result.stderr
 
 
 def test_dev_without_controller_environment_points_to_bootstrap(tmp_path: Path) -> None:

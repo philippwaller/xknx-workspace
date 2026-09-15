@@ -3,6 +3,7 @@ import builtins
 import json
 import socket
 import subprocess
+from io import StringIO
 from pathlib import Path
 from subprocess import CompletedProcess
 
@@ -228,6 +229,9 @@ def test_missing_macos_prerequisites_are_guidance_not_jobs() -> None:
         "tools": ("git", "uv", "tmux"),
         "command": ["brew", "install", "git", "uv", "tmux"],
     }]
+    lines: list[str] = []
+    ws.render_plan(guidance, lines.append)
+    assert lines == ["Install with: brew install git uv tmux"]
 
 
 def test_missing_package_source_guidance_renders_all_tools_and_link() -> None:
@@ -236,7 +240,7 @@ def test_missing_package_source_guidance_renders_all_tools_and_link() -> None:
     )
     lines: list[str] = []
     ws.render_plan(guidance, lines.append)
-    assert lines == ["MANUAL: install git, uv — https://brew.sh/"]
+    assert lines == ["Install git, uv: https://brew.sh/"]
 
 
 def test_default_plan_is_compact_and_verbose_plan_reveals_commands() -> None:
@@ -251,6 +255,23 @@ def test_default_plan_is_compact_and_verbose_plan_reveals_commands() -> None:
     assert not any("$ " in line for line in compact)
     assert any("5 repositories" in line for line in compact)
     assert any("$ " in line for line in verbose)
+
+
+def test_compact_plan_describes_smoke_once_while_retaining_lifecycle() -> None:
+    plan = [
+        {"kind": "smoke", "command": ["verify-imports"]},
+        {
+            "kind": "smoke",
+            "command": ["start-home-assistant"],
+            "lifecycle": "start, verify, then reap Home Assistant",
+        },
+    ]
+    lines: list[str] = []
+
+    ws.render_plan(plan, lines.append)
+
+    assert sum(line.startswith("Smoke test:") for line in lines) == 1
+    assert "start, verify, then reap Home Assistant" in lines
 
 
 def test_missing_nvm_is_blocking_and_never_resolves_or_runs_an_installer(
@@ -277,6 +298,29 @@ def test_missing_nvm_is_blocking_and_never_resolves_or_runs_an_installer(
     assert nvm["link"] == "https://github.com/nvm-sh/nvm#installing-and-updating"
 
 
+def test_missing_nvm_execution_reports_official_guidance_before_repository_work(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    plan = {
+        "root": tmp_path,
+        "tool_actions": [{
+            "kind": "tool", "tool": "nvm", "executable": None,
+            "installed": None, "blocking": True, "link": ws.TOOL_LINKS["nvm"],
+        }],
+        "repository_jobs": [ws.Job("must-not-run", tmp_path, (["false"],))],
+    }
+
+    assert asyncio.run(
+        ws.bootstrap_workspace(plan, ws.Progress("json", log_dir=tmp_path / "logs"))
+    ) == 2
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    failure = next(event for event in events if event["status"] == "error")
+    assert failure["task"] == "tool-nvm"
+    assert "Install nvm" in failure["detail"]
+    assert ws.TOOL_LINKS["nvm"] in failure["detail"]
+    assert not (tmp_path / "logs").exists()
+
+
 def test_prerequisite_failure_changes_no_workspace_state(tmp_path: Path) -> None:
     plan = {
         "root": tmp_path,
@@ -291,6 +335,41 @@ def test_prerequisite_failure_changes_no_workspace_state(tmp_path: Path) -> None
     code = asyncio.run(ws.bootstrap_workspace(plan, progress))
     assert code == 2
     assert sorted(tmp_path.rglob("*")) == before
+
+
+def test_missing_tool_execution_reports_native_guidance_without_running_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    brew = bin_dir / "brew"
+    brew.write_text(
+        "#!/bin/sh\nprintf called > " + str(tmp_path / "brew-called") + "\n"
+    )
+    brew.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    plan = {
+        "root": tmp_path,
+        "tool_actions": [
+            {
+                "kind": "tool", "tool": "git", "executable": None,
+                "installed": None, "minimum": "2.39.0", "blocking": True,
+            },
+            {
+                "kind": "manual", "blocking": True, "tools": ("git",),
+                "command": ["brew", "install", "git"],
+            },
+        ],
+    }
+
+    assert asyncio.run(
+        ws.bootstrap_workspace(plan, ws.Progress("json", log_dir=tmp_path / "logs"))
+    ) == 2
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    failure = next(event for event in events if event["status"] == "error")
+    assert "Install with: brew install git" in failure["detail"]
+    assert ws.TOOL_LINKS["git"] not in failure["detail"]
+    assert not (tmp_path / "brew-called").exists()
 
 
 def test_missing_docker_is_warning_not_failure() -> None:
@@ -744,6 +823,16 @@ def test_non_tty_progress_never_imports_rich(mode: str, monkeypatch, capsys) -> 
         assert "first" in output and "finished" in output
 
 
+def test_quiet_progress_hides_plan_lines(capsys: pytest.CaptureFixture[str]) -> None:
+    progress = ws.Progress("quiet")
+    progress.show_plan(["Platform: macos", "Repositories: 5"], profile="default", platform="macos")
+    progress.emit("bootstrap", "summary", "Plan declined")
+
+    assert capsys.readouterr().out.splitlines() == [
+        "bootstrap: summary: Plan declined"
+    ]
+
+
 def test_auto_tty_falls_back_when_rich_is_missing(monkeypatch, capsys) -> None:
     original_import = builtins.__import__
     monkeypatch.setattr(ws.sys.stdout, "isatty", lambda: True)
@@ -782,6 +871,22 @@ def test_tty_rows_use_fixed_component_result_and_duration_columns(
     assert [column.header for column in table.columns] == ["", "Komponente", "Ergebnis", "Dauer"]
     assert table.columns[2].min_width > 0
     assert table.columns[3].justify == "right"
+
+
+def test_tty_completed_rows_keep_long_log_paths_out_of_the_compact_table() -> None:
+    from rich.console import Console
+
+    progress = ws.Progress("tty")
+    progress.emit(
+        "Home Assistant Core", "success",
+        "Exit 0; log: /workspace/.state/logs/20260915T230000.000000Z-home-assistant.log",
+        duration=42.1,
+    )
+    output = StringIO()
+    Console(file=output, width=160, color_system=None).print(progress._task_table())
+
+    assert "Exit 0" in output.getvalue()
+    assert "/workspace/.state/logs" not in output.getvalue()
 
 
 def test_running_output_reuses_result_cell_without_detail_rows() -> None:
@@ -833,6 +938,29 @@ def test_finish_prefers_completed_smoke_failure_over_early_check_error(
     assert "Smoke exit 7" in summary
     assert "/workspace/.state/logs/smoke.log" in summary
     assert "Home Assistant is not ready" not in summary
+
+
+def test_finish_preserves_failed_smoke_substep_across_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rendered: list[str] = []
+    progress = ws.Progress("tty")
+    monkeypatch.setattr(progress, "_render_tty", lambda: None)
+    monkeypatch.setattr(progress, "_render_summary_tty", lambda lines, error: rendered.extend(lines))
+    progress.emit("smoke-home-assistant", "running", "Starting Home Assistant")
+    progress.emit("smoke-home-assistant", "error", "HTTP readiness check timed out")
+    progress.emit("smoke-home-assistant", "running", "Stopping and reaping Home Assistant")
+    progress.emit(
+        "smoke-home-assistant", "error",
+        "Smoke exit 1; log: /workspace/.state/logs/smoke.log", duration=1.2,
+    )
+
+    progress.finish(1, profile="default")
+
+    summary = " ".join(rendered)
+    assert "HTTP readiness check timed out" in summary
+    assert "Smoke exit 1" in summary
+    assert "Stopping and reaping" not in summary
 
 
 def test_bootstrap_stops_phases_and_reports_dependent_jobs_skipped(tmp_path: Path, capsys) -> None:
