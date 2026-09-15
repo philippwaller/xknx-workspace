@@ -95,16 +95,71 @@ def test_cancellation_kills_descendants_after_direct_child_closes_pipes(tmp_path
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("entry,args", [("bootstrap", ["--help"]), ("dev", ["--help"]), ("dev", ["start"]), ("dev", ["stop"]), ("dev", ["update"])])
-@pytest.mark.parametrize("existing_environment", [False, True])
-def test_launchers_never_sync_or_use_an_inherited_environment(tmp_path: Path, entry, args, existing_environment) -> None:
+def test_first_bootstrap_syncs_locked_controller_before_exec(tmp_path: Path) -> None:
+    root = Path(ws.__file__).parents[1]
+    (tmp_path / "bootstrap").write_bytes((root / "bootstrap").read_bytes())
+    (tmp_path / ".workspace").mkdir()
+    (tmp_path / ".workspace/xknx_workspace.py").write_text("")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "dirname").symlink_to("/usr/bin/dirname")
+    python3 = bin_dir / "python3"
+    python3.write_text("#!/bin/sh\ncase \"$*\" in *sys.version_info*) exit 0;; esac\nexit 90\n")
+    python3.chmod(0o755)
+    uv = bin_dir / "uv"
+    uv.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + shlex.quote(str(tmp_path / "uv.args")) + "\n"
+        "/bin/mkdir -p " + shlex.quote(str(tmp_path / ".workspace/.venv/bin")) + "\n"
+        "printf '#!/bin/sh\\nprintf \"%%s\\\\n\" \"$@\"\\n' > "
+        + shlex.quote(str(tmp_path / ".workspace/.venv/bin/python")) + "\n"
+        "/bin/chmod +x " + shlex.quote(str(tmp_path / ".workspace/.venv/bin/python")) + "\n"
+    )
+    uv.chmod(0o755)
+    result = subprocess.run(
+        ["/bin/sh", str(tmp_path / "bootstrap"), "default"],
+        env={"PATH": str(bin_dir), "UV_PROJECT_ENVIRONMENT": str(tmp_path / "unrelated")},
+        capture_output=True, text=True, check=False,
+    )
+    expected = [
+        "sync", "--quiet", "--project", str(tmp_path / ".workspace"), "--locked",
+        "--no-dev", "--no-python-downloads", "--python", str(python3),
+    ]
+    assert result.returncode == 0
+    assert (tmp_path / "uv.args").read_text().splitlines() == expected
+    assert result.stdout.splitlines()[-2:] == ["bootstrap", "default"]
+    assert not (tmp_path / "unrelated").exists()
+
+
+def test_dev_without_controller_environment_points_to_bootstrap(tmp_path: Path) -> None:
+    root = Path(ws.__file__).parents[1]
+    (tmp_path / "bootstrap").write_bytes((root / "bootstrap").read_bytes())
+    (tmp_path / "dev").write_bytes((root / "dev").read_bytes())
+    (tmp_path / ".workspace").mkdir()
+    (tmp_path / ".workspace/xknx_workspace.py").write_text("")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "dirname").symlink_to("/usr/bin/dirname")
+    python3 = bin_dir / "python3"
+    python3.write_text("#!/bin/sh\ncase \"$*\" in *sys.version_info*) exit 0;; esac\nexit 90\n")
+    python3.chmod(0o755)
+    result = subprocess.run(
+        ["/bin/sh", str(tmp_path / "dev"), "status"],
+        env={"PATH": str(bin_dir)}, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 2
+    assert "./bootstrap" in result.stderr
+    assert "uv sync" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("args", [["--help"], ["start"], ["stop"], ["update"]])
+def test_dev_never_syncs_or_uses_an_inherited_environment(tmp_path: Path, args: list[str]) -> None:
     root = Path(ws.__file__).parents[1]
     for name in ("bootstrap", "dev"):
         (tmp_path / name).write_bytes((root / name).read_bytes())
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "dirname").symlink_to("/usr/bin/dirname")
-    interpreter = tmp_path / ".workspace/.venv/bin/python" if existing_environment else bin_dir / "python3"
+    interpreter = tmp_path / ".workspace/.venv/bin/python"
     interpreter.parent.mkdir(parents=True, exist_ok=True)
     interpreter.write_text(
         "#!/bin/sh\n"
@@ -116,7 +171,7 @@ def test_launchers_never_sync_or_use_an_inherited_environment(tmp_path: Path, en
     uv = bin_dir / "uv"
     uv.write_text("#!/bin/sh\nprintf 'unexpected uv call\\n'\nexit 79\n")
     uv.chmod(0o755)
-    result = subprocess.run(["/bin/sh", str(tmp_path / entry), *args], env={"PATH": str(bin_dir), "UV_PROJECT_ENVIRONMENT": str(tmp_path / "unrelated")}, capture_output=True, text=True)
+    result = subprocess.run(["/bin/sh", str(tmp_path / "dev"), *args], env={"PATH": str(bin_dir), "UV_PROJECT_ENVIRONMENT": str(tmp_path / "unrelated")}, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "direct interpreter:" in result.stdout and "unexpected uv" not in result.stdout
     assert not (tmp_path / "unrelated").exists()
@@ -1608,8 +1663,7 @@ def test_bootstrap_smoke_failure_code_reaches_summary(tmp_path: Path, monkeypatc
     assert "exit code 7" in events[-1]["detail"]
 
 
-@pytest.mark.parametrize("python_available", [True, False])
-def test_status_launcher_uses_only_existing_interpreters_without_sync(tmp_path: Path, python_available: bool) -> None:
+def test_status_launcher_uses_an_existing_controller_without_sync(tmp_path: Path) -> None:
     controller = tmp_path / ".workspace"
     controller.mkdir()
     (controller / "xknx_workspace.py").write_text((ws.ROOT / ".workspace/xknx_workspace.py").read_text())
@@ -1619,15 +1673,9 @@ def test_status_launcher_uses_only_existing_interpreters_without_sync(tmp_path: 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "dirname").symlink_to("/usr/bin/dirname")
-    python = bin_dir / "python3"
-    if python_available:
-        python.symlink_to(sys.executable)
-    else:
-        python.write_text("#!/bin/sh\nexit 1\n")
-        python.chmod(0o755)
-        interpreter = controller / ".venv/bin/python"
-        interpreter.parent.mkdir(parents=True)
-        interpreter.symlink_to(sys.executable)
+    interpreter = controller / ".venv/bin/python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.symlink_to(sys.executable)
     uv = bin_dir / "uv"
     uv.write_text(
         f"#!{sys.executable}\nimport os, sys\n"
@@ -1640,19 +1688,6 @@ def test_status_launcher_uses_only_existing_interpreters_without_sync(tmp_path: 
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["profile"] == "default"
     assert sorted(str(path) for path in tmp_path.rglob("*")) == before
-
-
-def test_status_launcher_without_python_or_environment_gives_actionable_error(tmp_path: Path) -> None:
-    launcher = tmp_path / "dev"
-    launcher.write_text((ws.ROOT / "dev").read_text())
-    (tmp_path / "bootstrap").write_text((ws.ROOT / "bootstrap").read_text())
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    (bin_dir / "dirname").symlink_to("/usr/bin/dirname")
-    result = subprocess.run(["/bin/sh", str(launcher), "status", "--format", "json"], env={"PATH": str(bin_dir)}, capture_output=True, text=True, check=False)
-    assert result.returncode == 2
-    assert "Python 3.12+" in result.stderr and "python.org" in result.stderr
-    assert not (tmp_path / ".workspace").exists()
 
 
 def test_malformed_http_response_is_an_actionable_check_and_valid_status_json(tmp_path: Path, monkeypatch, capsys, ha_http_server) -> None:
