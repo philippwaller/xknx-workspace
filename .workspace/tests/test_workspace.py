@@ -44,7 +44,8 @@ def test_automation_is_bounded_and_does_not_start_background_services(
     assert "os: [ubuntu-latest, macos-latest]" in ci
     assert "runs-on: ${{ matrix.os }}" in ci
     assert "timeout-minutes:" in ci
-    assert "astral-sh/setup-uv@v7" in ci
+    assert "uses: actions/checkout@" in ci
+    assert "uses: astral-sh/setup-uv@" in ci
     assert "uv sync --project .workspace --locked --group dev" in ci
     assert "sh -n bootstrap dev" in ci
     assert "./bootstrap" not in ci and "./dev start" not in ci
@@ -53,8 +54,15 @@ def test_automation_is_bounded_and_does_not_start_background_services(
     assert "schedule:" in smoke and "workflow_dispatch:" in smoke
     assert "runs-on: ${{ matrix.os }}" in smoke
     assert "timeout-minutes:" in smoke
-    assert "./dev status --format json" in smoke
-    assert "actions/upload-artifact@v7" in smoke
+    assert "uses: actions/checkout@" in smoke
+    assert "uses: astral-sh/setup-uv@" in smoke
+    status_step = next(
+        step
+        for step in smoke.split("\n      - ")
+        if "run: ./dev status --format json" in step
+    )
+    assert status_step.startswith("if: always()\n        run: ./dev status --format json")
+    assert "uses: actions/upload-artifact@" in smoke
     assert "if: failure()" in smoke
     assert "path: .state/logs/*.log" in smoke
     assert "if-no-files-found: ignore" in smoke
