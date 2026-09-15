@@ -1,0 +1,22 @@
+/*
+
+# Files owned by the workspace repository.
+!/.agents/
+!/.agents/**
+!/.github/
+!/.github/**
+!/docs/
+!/docs/**
+!/src/
+!/src/**
+!/tests/
+!/tests/**
+!/AGENTS.md
+!/LICENSE
+!/README.md
+!/bootstrap
+!/dev
+!/pyproject.toml
+!/uv.lock
+!/.xknx-dev.example.toml
+!/.gitignore
