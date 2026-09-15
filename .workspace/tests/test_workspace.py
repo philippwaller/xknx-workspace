@@ -701,6 +701,60 @@ def test_main_update_logs_oserror_and_keeps_the_tty_error_row(
 
 
 @pytest.mark.parametrize(
+    ("probe", "probe_code", "failure_code"),
+    [
+        (["symbolic-ref", "--short", "HEAD"], 128, 1),
+        (
+            ["merge-base", "--is-ancestor", "HEAD", "refs/remotes/origin/HEAD"],
+            1,
+            128,
+        ),
+    ],
+)
+def test_main_update_ignores_accepted_probe_codes_when_propagating_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    probe: list[str],
+    probe_code: int,
+    failure_code: int,
+) -> None:
+    path = tmp_path / "knx-frontend"
+    path.mkdir()
+
+    def update(path: Path, origin: str, runner) -> dict[str, object]:
+        runner(
+            ["git", "-C", str(path), *probe],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        runner(
+            ["git", "-C", str(path), "submodule", "update", "--init", "homeassistant-frontend"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return repository_result(path, error="submodule unavailable")
+
+    calls = iter(
+        (
+            CompletedProcess([], probe_code, "", "accepted probe"),
+            CompletedProcess([], failure_code, "", "submodule unavailable"),
+        )
+    )
+    monkeypatch.setattr(ws, "ROOT", tmp_path)
+    monkeypatch.setattr(ws, "repositories_for", lambda profile: ("knx-frontend",))
+    monkeypatch.setattr(ws, "ensure_repository", update)
+    monkeypatch.setattr(ws.subprocess, "run", lambda *args, **kwargs: next(calls))
+
+    assert ws.main(["dev", "update", "default", "--progress", "quiet"]) == failure_code
+    log = next((tmp_path / ".state/logs").glob("*.log")).read_text()
+    assert f"returncode: {failure_code}" in log
+    assert "accepted probe" in log and "submodule unavailable" in log
+    assert '"submodule", "update", "--init", "homeassistant-frontend"' in log
+
+
+@pytest.mark.parametrize(
     ("state", "expected"),
     [
         ({"on_default": True, "clean": True, "ahead": 0, "behind": 2, "diverged": False}, "fast-forward"),

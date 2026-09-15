@@ -1830,7 +1830,13 @@ def update_repository(
             raise
         stdout.append(result.stdout or "")
         stderr.append(result.stderr or "")
-        first_failure = first_failure or result.returncode
+        git_args = commands[-1][3:]
+        accepted = git_args == ["symbolic-ref", "--short", "HEAD"] or (
+            result.returncode == 1
+            and git_args[:2] == ["merge-base", "--is-ancestor"]
+        )
+        if result.returncode and not accepted:
+            first_failure = first_failure or result.returncode
         return result
 
     try:
