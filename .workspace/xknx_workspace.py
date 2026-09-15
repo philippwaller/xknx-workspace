@@ -600,10 +600,14 @@ def nvm_shell(command: list[str]) -> list[str]:
     ]
 
 
-def project_setup_jobs(root: Path, profile: str, *, reuse_ha_config: bool = False) -> list[Job]:
+def project_setup_jobs(
+    root: Path, profile: str, *, reuse_ha_config: bool = False, ha_config_dir: Path | None = None,
+) -> list[Job]:
     root = root.resolve()
+    default_config = root / "home-assistant-core/config"
+    selected_config = (root / ha_config_dir).resolve() if ha_config_dir is not None else default_config
     ha_commands = (["script/setup"],)
-    if reuse_ha_config or (root / "home-assistant-core/config").exists():
+    if selected_config != default_config or reuse_ha_config or default_config.exists():
         ha_commands = (["uv", "venv"], ["bash", "-c", ". .venv/bin/activate && script/bootstrap"])
     elif (root / "home-assistant-core/.venv/bin/python").is_file():
         ha_commands = (["bash", "-c", ". .venv/bin/activate && script/setup"],)
@@ -703,7 +707,6 @@ def configuration_action(root: Path, settings: Mapping[str, object]) -> dict[str
         "kind": "configuration", "path": str(local), "action": "reuse" if local.exists() else "create",
         "sha256": hashlib.sha256(local.read_bytes()).hexdigest() if local.exists() else None,
         "config_dir": str(config_dir), "reuse_config": config_dir.exists(),
-        "setup_config_exists": (root / "home-assistant-core/config").exists(),
         "explicit_config": Path(raw_path).is_absolute() or raw_path != DEFAULTS["home_assistant"]["config_dir"],
         "port": port, "knx_mode": knx["mode"], "secure_config_path": str(secure) if secure else None,
     }
@@ -720,10 +723,7 @@ def create_home_assistant_configuration(action: Mapping[str, object]) -> None:
     if action["reuse_config"]:
         return
     directory = Path(action["config_dir"])
-    setup_config = Path(action["path"]).parent / "home-assistant-core/config"
-    if directory.resolve() != directory or directory.exists() or (
-        not action["setup_config_exists"] and (setup_config.exists() or setup_config.is_symlink())
-    ):
+    if directory.resolve() != directory or directory.exists():
         raise ValueError("home_assistant.config_dir changed after confirmation; review bootstrap again")
     try:
         directory.mkdir(parents=True)
@@ -960,7 +960,9 @@ def build_bootstrap_plan(
     plan.append(configuration)
     plan.extend(
         {"kind": "setup", "name": job.name, "cwd": str(job.cwd), "commands": job.commands}
-        for job in project_setup_jobs(root, profile, reuse_ha_config=configuration["reuse_config"])
+        for job in project_setup_jobs(
+            root, profile, reuse_ha_config=configuration["reuse_config"], ha_config_dir=Path(configuration["config_dir"]),
+        )
     )
     plan.append({"kind": "wiring", "command": home_assistant_wiring_command(root)})
     plan.append({"kind": "smoke", "command": home_assistant_import_command(root)})

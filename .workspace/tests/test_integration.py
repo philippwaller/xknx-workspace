@@ -772,9 +772,8 @@ def test_confirmed_bootstrap_creates_config_sets_up_then_checks_imports(tmp_path
 
 
 @pytest.mark.parametrize("with_yaml", [False, True])
-@pytest.mark.parametrize("config_dir", ["home-assistant-core/config", "custom-config"])
-def test_config_appearing_during_checkout_stops_before_setup(tmp_path: Path, capsys, with_yaml: bool, config_dir: str) -> None:
-    settings = ws.load_settings(tmp_path, {"XKNX_HA_CONFIG_DIR": config_dir})
+def test_config_appearing_during_checkout_stops_before_setup(tmp_path: Path, capsys, with_yaml: bool) -> None:
+    settings = ws.load_settings(tmp_path, {})
     action = ws.configuration_action(tmp_path, settings)
     (tmp_path / ".xknx-dev.example.toml").write_text((ws.ROOT / ".xknx-dev.example.toml").read_text())
     checkout = ws.Job("checkout", tmp_path, ([sys.executable, "-c",
@@ -832,3 +831,61 @@ def test_wiring_preserves_command_exit_code_and_skips_smoke(tmp_path: Path, monk
     assert any(event["task"] == "smoke_default" and event["status"] == "skipped" for event in events)
     log = next((tmp_path / "logs").glob("*.log")).read_text()
     assert f"returncode: {failure}" in log
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_custom_config_plan_always_selects_dependency_bootstrap(tmp_path: Path, monkeypatch, existing: bool) -> None:
+    fake_planning_tools(monkeypatch)
+    custom = tmp_path / "custom-config"
+    if existing:
+        custom.mkdir()
+    settings = ws.load_settings(tmp_path, {"XKNX_HA_CONFIG_DIR": str(custom)})
+    plan = ws.build_bootstrap_plan(tmp_path, "default", settings)
+    ha = next(item for item in plan if item.get("kind") == "setup" and item["name"] == "Home Assistant Core")
+    assert ha["commands"] == (["uv", "venv"], ["bash", "-c", ". .venv/bin/activate && script/bootstrap"])
+
+
+@pytest.mark.parametrize("appears_during", ["checkout", "custom-creation"])
+def test_custom_config_bootstrap_never_touches_late_fixed_config(tmp_path: Path, monkeypatch, appears_during: str) -> None:
+    fake_planning_tools(monkeypatch)
+    core = tmp_path / "home-assistant-core"
+    custom = tmp_path / "custom-config"
+    fixed = core / "config"
+    (core / "script").mkdir(parents=True)
+    (core / ".venv/bin").mkdir(parents=True)
+    (core / ".venv/bin/python").touch()
+    (core / ".venv/bin/activate").touch()
+    for name, body in {"bootstrap": "touch bootstrap.started", "setup": "touch setup.started; echo modified > config/configuration.yaml"}.items():
+        script = core / "script" / name
+        script.write_text("#!/bin/sh\n" + body + "\n")
+        script.chmod(0o755)
+    (tmp_path / ".xknx-dev.example.toml").write_text((ws.ROOT / ".xknx-dev.example.toml").read_text())
+    settings = ws.load_settings(tmp_path, {"XKNX_HA_CONFIG_DIR": str(custom)})
+    planned = ws.build_bootstrap_plan(tmp_path, "default", settings)
+    configuration = next(item for item in planned if item.get("kind") == "configuration")
+    ha = next(item for item in planned if item.get("kind") == "setup" and item["name"] == "Home Assistant Core")
+    repositories = []
+    if appears_during == "checkout":
+        repositories.append(ws.Job("checkout", tmp_path, ([sys.executable, "-c",
+            "from pathlib import Path; config = Path('home-assistant-core/config'); config.mkdir(); (config / 'configuration.yaml').write_text('developer-owned\\n')",
+        ],)))
+    else:
+        mkdir = Path.mkdir
+
+        def raced_mkdir(path, *args, **kwargs):
+            mkdir(path, *args, **kwargs)
+            if path == custom:
+                fixed.mkdir()
+                (fixed / "configuration.yaml").write_text("developer-owned\n")
+
+        monkeypatch.setattr(Path, "mkdir", raced_mkdir)
+    execution = {
+        "root": tmp_path, "settings": settings, "configuration": configuration,
+        "repository_jobs": repositories,
+        "project_setup_jobs": [ws.Job(ha["name"], Path(ha["cwd"]), ha["commands"])],
+    }
+    assert asyncio.run(ws.bootstrap_workspace(execution, ws.Progress("quiet", log_dir=tmp_path / "logs"))) == 0
+    assert (core / "bootstrap.started").exists()
+    assert not (core / "setup.started").exists()
+    assert (fixed / "configuration.yaml").read_text() == "developer-owned\n"
+    assert (custom / "configuration.yaml").read_text() == "default_config:\nhttp:\n  server_port: 8123\n"
