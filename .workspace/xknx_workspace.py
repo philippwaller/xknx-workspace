@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import codecs
 import hashlib
 import json
 import os
@@ -8,10 +10,14 @@ import platform as platform_module
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import time
 import tomllib
 import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -85,6 +91,348 @@ NODE_REPOSITORIES = {"home-assistant-frontend", "knx-frontend", "xknxtoolkit", "
 CONFIRMED_PLAN_ENV = "XKNX_WORKSPACE_CONFIRMED_PLAN"
 CONFIRMED_PLAN_DIGEST_ENV = "XKNX_WORKSPACE_CONFIRMED_PLAN_SHA256"
 NVM_RELEASE_API = "https://api.github.com/repos/nvm-sh/nvm/releases/latest"
+
+
+@dataclass
+class Job:
+    name: str
+    cwd: Path
+    commands: tuple[list[str], ...]
+
+
+@dataclass
+class Result:
+    name: str
+    returncode: int
+    duration: float
+    status: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.status:
+            self.status = "success" if self.returncode == 0 else "error"
+
+
+def secret_values(environ: Mapping[str, str] = os.environ) -> set[str]:
+    return {value for name, value in environ.items() if value and name.upper().endswith(("TOKEN", "PASSWORD", "SECRET", "KEY"))}
+
+
+def redact(text: str, secrets: set[str]) -> str:
+    for value in sorted(filter(None, secrets), key=len, reverse=True):
+        text = text.replace(json.dumps(value)[1:-1], "***")
+        text = text.replace(value, "***")
+    return text
+
+
+def write_task_log(
+    directory: Path, name: str, *, command: Sequence[object], stdout: str,
+    stderr: str, returncode: int, cwd: Path | None = None,
+    start: datetime | None = None, end: datetime | None = None,
+    duration: float = 0, secrets: set[str] | None = None,
+    versions: Mapping[str, object] | None = None, decisions: Sequence[object] = (),
+) -> Path:
+    end = end or datetime.now(timezone.utc)
+    start = start or end
+    values = secret_values() | (secrets or set())
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "-", redact(name, values)).strip("-") or "task"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{end.strftime('%Y%m%dT%H%M%S.%fZ')}-{safe_name}.log"
+    content = (
+        f"task: {name}\ncwd: {cwd or Path.cwd()}\n"
+        f"argv: {json.dumps(command)}\nstart: {start.isoformat()}\nend: {end.isoformat()}\n"
+        f"duration: {duration:.3f}s\nreturncode: {returncode}\n"
+        f"versions: {json.dumps(versions or {}, default=str)}\n"
+        f"decisions: {json.dumps(decisions, default=str)}\nstdout:\n{stdout}\nstderr:\n{stderr}\n"
+    )
+    with path.open("x") as log:
+        log.write(redact(content, values))
+        log.flush()
+        os.fsync(log.fileno())
+    return path
+
+
+class Progress:
+    def __init__(
+        self, mode: str = "auto", *, log_dir: Path | None = None,
+        secrets: set[str] | None = None, verbose: bool = False,
+        versions: Mapping[str, object] | None = None, decisions: Sequence[object] = (),
+    ) -> None:
+        self.mode = ("tty" if sys.stdout.isatty() else "plain") if mode == "auto" else mode
+        self.log_dir = log_dir or ROOT / ".state/logs"
+        self.secrets = secret_values() | (secrets or set())
+        self.verbose = verbose
+        self.versions = versions or {}
+        self.decisions = decisions
+        self.rows: dict[str, tuple[str, str]] = {}
+        self.live = None
+        self.first_error = False
+
+    def emit(self, task: str, status: str, detail: str) -> None:
+        task, detail = (redact(value, self.secrets) for value in (task, detail))
+        detail = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))", "", detail)
+        detail = " ".join(detail.splitlines())
+        self.rows[task] = (status, detail)
+        if self.mode == "tty":
+            try:
+                self._render_tty()
+                return
+            except ImportError:
+                self.mode = "plain"
+        if self.mode == "json":
+            print(json.dumps({"task": task, "status": status, "detail": detail}), flush=True)
+        elif self.mode != "quiet" or status == "summary" or (status == "error" and not self.first_error):
+            print(f"{task}: {status}: {detail}", flush=True)
+        if status == "error":
+            self.first_error = True
+
+    def _render_tty(self) -> None:
+        from rich.console import Console
+        from rich.live import Live
+        from rich.table import Table
+        from rich.text import Text
+
+        table = Table("Task", "Status", "Detail", expand=True)
+        for task, (status, detail) in self.rows.items():
+            table.add_row(Text(task), Text(status), Text(detail))
+        if self.live is None:
+            self.live = Live(table, console=Console(file=sys.stdout), refresh_per_second=8)
+            self.live.start()
+        else:
+            self.live.update(table)
+
+    def close(self) -> None:
+        if self.live is not None:
+            self.live.stop()
+            self.live = None
+
+
+async def _stop_process(process, completion) -> None:
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(asyncio.shield(completion), 0.5)
+            return
+        except TimeoutError:
+            continue
+    await completion
+
+
+async def run_job(job: Job, progress: Progress, *, command_runner=None, verify=None) -> Result:
+    start, clock_start = datetime.now(timezone.utc), time.monotonic()
+    # ponytail: buffer each task's output; spool to disk if build logs exhaust memory.
+    stdout: list[str] = []
+    stderr: list[str] = []
+    commands: list[list[str]] = []
+    returncode = 0
+
+    async def read_output(stream, output: list[str]) -> None:
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        pending = ""
+        while chunk := await stream.read(65536):
+            text = decoder.decode(chunk)
+            output.append(text)
+            lines = (pending + text).replace("\r", "\n").split("\n")
+            pending = lines.pop()
+            for line in lines:
+                if line.strip():
+                    detail = redact(line, progress.secrets)
+                    progress.emit(job.name, "running", detail if progress.verbose else detail[-500:])
+        tail = decoder.decode(b"", final=True)
+        output.append(tail)
+        if pending + tail:
+            progress.emit(job.name, "running", pending + tail)
+
+    try:
+        for command in job.commands:
+            commands.append(command)
+            progress.emit(job.name, "running", f"$ {shlex.join(command)}")
+            if command_runner is not None:
+                result = command_runner(command, cwd=job.cwd, capture_output=True, text=True, check=False)
+                stdout.append(result.stdout or "")
+                stderr.append(result.stderr or "")
+                returncode = result.returncode
+            else:
+                process = await asyncio.create_subprocess_exec(
+                    *command, cwd=job.cwd, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE, start_new_session=True,
+                )
+                completion = asyncio.gather(
+                    read_output(process.stdout, stdout), read_output(process.stderr, stderr), process.wait()
+                )
+                try:
+                    await asyncio.shield(completion)
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    await _stop_process(process, completion)
+                    raise
+                returncode = process.returncode
+            if returncode != 0:
+                break
+        if returncode == 0 and verify is not None:
+            if error := verify():
+                returncode = 2
+                stderr.append(error)
+    except OSError as error:
+        returncode = 127
+        stderr.append(str(error))
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        returncode = 130
+        stderr.append("Interrupted")
+        raise
+    finally:
+        duration = time.monotonic() - clock_start
+        path = write_task_log(
+            progress.log_dir, job.name, cwd=job.cwd, command=commands,
+            stdout="".join(stdout), stderr="".join(stderr), returncode=returncode,
+            start=start, duration=duration, secrets=progress.secrets,
+            versions=progress.versions, decisions=progress.decisions,
+        )
+        progress.emit(job.name, "success" if returncode == 0 else "error", f"Exit {returncode} after {duration:.2f}s; log: {path}")
+    return Result(job.name, returncode, duration)
+
+
+async def run_jobs(
+    jobs: Sequence[Job], limit: int = 3, progress: Progress | None = None, *,
+    runner=None, expected: Mapping[str, Sequence[Path]] | None = None,
+) -> list[Result]:
+    if limit < 1:
+        raise ValueError("jobs must be positive")
+    progress = progress or Progress()
+    queue = asyncio.Queue()
+    results: dict[int, Result] = {}
+    failed = False
+    for index, job in enumerate(jobs):
+        queue.put_nowait((index, job))
+
+    async def worker() -> None:
+        nonlocal failed
+        while not failed and not queue.empty():
+            index, job = queue.get_nowait()
+            artifacts = (expected or {}).get(job.name, ())
+            if artifacts and all(path.exists() for path in artifacts):
+                results[index] = Result(job.name, 0, 0, "skipped")
+                progress.emit(job.name, "skipped", "Expected artifacts already exist")
+                continue
+            progress.emit(job.name, "running", "Starting")
+            try:
+                result = await runner(job) if runner else await run_job(job, progress)
+            except asyncio.CancelledError:
+                failed = True
+                results[index] = Result(job.name, 130, 0, "error")
+                raise
+            except Exception as error:
+                result = Result(job.name, 1, 0)
+                progress.emit(job.name, "error", str(error))
+            results[index] = result
+            if result.returncode != 0:
+                failed = True
+
+    workers = [asyncio.create_task(worker()) for _ in range(min(limit, len(jobs)))]
+    try:
+        await asyncio.gather(*workers)
+    except asyncio.CancelledError:
+        failed = True
+        for worker_task in workers:
+            worker_task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        raise
+    finally:
+        while not queue.empty():
+            index, job = queue.get_nowait()
+            results[index] = Result(job.name, 1, 0, "skipped")
+            progress.emit(job.name, "skipped", "An earlier task failed or was interrupted")
+    return [results[index] for index in range(len(jobs))]
+
+
+def repository_jobs(root: Path, repositories: Mapping[str, str]) -> list[Job]:
+    return [
+        Job(name, root, ([sys.executable, str(Path(__file__).resolve()), "_repository", str(root / name), origin],))
+        for name, origin in repositories.items()
+    ]
+
+
+async def run_tool_actions(actions, progress: Progress, *, root: Path = ROOT, command_runner=None) -> list[Result]:
+    results = []
+    failed = False
+    for index, item in enumerate(actions):
+        name = f"tool-{item.get('tool', index)}"
+        manual = item.get("kind") == "manual" and "scope" not in item
+        if not manual and (item.get("kind") not in {"package", "installer"} or not item.get("command")):
+            continue
+        if failed:
+            results.append(Result(name, 1, 0, "skipped"))
+            progress.emit(name, "skipped", "An earlier prerequisite failed")
+            continue
+        if manual:
+            progress.emit(name, "error", f"Install {item['tool']}: {item.get('link', '')}")
+            results.append(Result(name, 2, 0))
+            failed = True
+            continue
+
+        def verify():
+            if item.get("kind") == "installer" and item.get("tool") == "nvm":
+                installed = inspect_tool("nvm")["installed"]
+                progress.versions = {**progress.versions, "nvm": installed}
+                if not isinstance(installed, str) or (item.get("version") and installed != item["version"]):
+                    return "Installed NVM version could not be verified"
+            return None
+
+        result = await run_job(
+            Job(name, root, (item["command"],)), progress, command_runner=command_runner, verify=verify
+        )
+        results.append(result)
+        failed = result.returncode != 0
+    return results
+
+
+async def bootstrap_workspace(plan: dict[str, object], progress: Progress) -> int:
+    pending = [*plan.get("repository_jobs", ()), *plan.get("project_setup_jobs", ())]
+    pending_callbacks = {name for name in ("wire_home_assistant", "smoke_default") if plan.get(name)}
+    code = 1
+    try:
+        results = await run_tool_actions(
+            plan.get("tool_actions", ()), progress, root=plan["root"], command_runner=plan.get("command_runner")
+        )
+        if not all(result.returncode == 0 for result in results):
+            code = next(result.returncode for result in results if result.returncode != 0)
+            return code
+        if reexec := plan.get("reexec"):
+            reexec()
+            pending = []
+            pending_callbacks.clear()
+            code = 0
+            return code
+        pending = list(plan.get("project_setup_jobs", ()))
+        results = await run_jobs(plan.get("repository_jobs", ()), plan.get("jobs", 3), progress)
+        if not all(result.returncode == 0 for result in results):
+            return 1
+        pending = []
+        results = await run_jobs(
+            plan.get("project_setup_jobs", ()), plan.get("jobs", 3), progress, expected=plan.get("expected_artifacts")
+        )
+        if not all(result.returncode == 0 for result in results):
+            return 1
+        if wire := plan.get("wire_home_assistant"):
+            pending_callbacks.remove("wire_home_assistant")
+            if not await wire(plan, progress):
+                return 1
+        if smoke := plan.get("smoke_default"):
+            pending_callbacks.remove("smoke_default")
+            if not await smoke(plan, progress):
+                return 1
+        code = 0
+        return code
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        code = 130
+        progress.emit("bootstrap", "error", "Interrupted")
+        return code
+    finally:
+        for job in pending:
+            progress.emit(job.name, "skipped", "A prerequisite failed or was interrupted")
+        for name in sorted(pending_callbacks):
+            progress.emit(name, "skipped", "A prerequisite failed or was interrupted")
+        progress.emit("bootstrap", "summary", f"Finished with exit code {code}; logs: {progress.log_dir}")
 
 
 def detect_platform(os_release: str | None = None, uname: str | None = None) -> str:
@@ -439,11 +787,16 @@ def run_bootstrap(
     yes: bool,
     argv: Sequence[str],
     enforce_tool_versions: bool = False,
+    jobs: int = 3,
+    progress_mode: str = "auto",
+    verbose: bool = False,
     environ: Mapping[str, str] = os.environ,
     input_fn=input,
-    runner=subprocess.run,
+    runner=None,
     reexec=os.execvpe,
 ) -> int:
+    if jobs < 1:
+        raise ValueError("jobs must be positive")
     marker = environ.get(CONFIRMED_PLAN_DIGEST_ENV)
     carried = environ.get(CONFIRMED_PLAN_ENV)
     if marker or carried:
@@ -452,18 +805,15 @@ def run_bootstrap(
         confirmed_plan = json.loads(carried)
         validate_plan_digest(confirmed_plan, marker)
         settings = load_settings(root, environ)
-        current_plan = build_bootstrap_plan(
+        plan = build_bootstrap_plan(
             root, profile, settings, enforce_tool_versions=enforce_tool_versions
         )
-        validate_reexec_plan(confirmed_plan, current_plan)
-        return 0
-    settings = load_settings(root, environ)
-    plan = build_bootstrap_plan(
-        root, profile, settings, enforce_tool_versions=enforce_tool_versions
-    )
-    render_plan(plan)
-    if not yes and input_fn("Execute this plan? [y/N] ").strip().lower() not in {"y", "yes"}:
-        return 1
+        validate_reexec_plan(confirmed_plan, plan)
+    else:
+        settings = load_settings(root, environ)
+        plan = build_bootstrap_plan(
+            root, profile, settings, enforce_tool_versions=enforce_tool_versions
+        )
     uv_missing = any(
         item.get("kind") == "tool" and item.get("tool") == "uv" and item.get("executable") is None
         for item in plan
@@ -472,21 +822,8 @@ def run_bootstrap(
         item.get("kind") == "package" and "uv" in item.get("command", ())
         for item in plan
     )
-    for item in plan:
-        if item.get("kind") not in {"package", "installer"} or not item.get("command"):
-            continue
-        result = runner(item["command"], check=False)
-        if result.returncode:
-            return int(result.returncode)
-        if item.get("kind") == "installer" and item.get("tool") == "nvm":
-            installed = inspect_tool("nvm")["installed"]
-            if not isinstance(installed, str) or (
-                item.get("version") and installed != item["version"]
-            ):
-                return 2
-    if any(item.get("kind") == "manual" and "scope" not in item for item in plan):
-        return 2
-    if uv_will_be_installed:
+
+    def reexec_with_plan() -> None:
         child_environ = dict(environ)
         child_environ[CONFIRMED_PLAN_ENV] = _serialized_plan(plan)
         child_environ[CONFIRMED_PLAN_DIGEST_ENV] = plan_digest(plan)
@@ -500,8 +837,43 @@ def run_bootstrap(
             str(Path(__file__).resolve()),
             *argv,
         ]
+        progress.close()
         reexec(command[0], command, child_environ)
-    return 0
+
+    progress = Progress(
+        progress_mode, log_dir=root / ".state/logs", secrets=secret_values(environ), verbose=verbose,
+        versions={str(item["tool"]): item.get("installed") for item in plan if item.get("kind") == "tool"},
+        decisions=plan,
+    )
+    context = next((item for item in plan if item.get("kind") == "context"), {})
+    execution = {
+        "root": root, "profile": profile, "settings": settings,
+        "tool_actions": plan, "jobs": jobs, "command_runner": runner,
+        "repository_jobs": repository_jobs(root, {name: REPOSITORIES[name] for name in context.get("repositories", ())}),
+        "project_setup_jobs": [],
+        "reexec": reexec_with_plan if uv_will_be_installed else None,
+    }
+    try:
+        if not marker:
+            lines = []
+            render_plan(plan, lines.append)
+            for index, line in enumerate(lines):
+                progress.emit(f"plan-{index + 1}", "planned", line)
+            if not yes:
+                progress.close()
+                prompt = "Execute this plan? [y/N] "
+                if progress_mode == "json":
+                    print(prompt, file=sys.stderr)
+                    prompt = ""
+                if input_fn(prompt).strip().lower() not in {"y", "yes"}:
+                    progress.emit("bootstrap", "summary", "Plan declined")
+                    return 1
+        return asyncio.run(bootstrap_workspace(execution, progress))
+    except KeyboardInterrupt:
+        progress.emit("bootstrap", "summary", "Interrupted; exit code 130")
+        return 130
+    finally:
+        progress.close()
 
 
 def repositories_for(profile: str) -> tuple[str, ...]:
@@ -704,7 +1076,7 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap = commands.add_parser("bootstrap")
     bootstrap.add_argument("profile", nargs="?", default="default")
     bootstrap.add_argument("--yes", action="store_true")
-    bootstrap.add_argument("--jobs", type=int)
+    bootstrap.add_argument("--jobs", type=int, default=3)
     bootstrap.add_argument("--progress", choices=("auto", "tty", "plain", "json", "quiet"), default="auto")
     bootstrap.add_argument("--verbose", action="store_true")
     bootstrap.add_argument("--enforce-tool-versions", action="store_true")
@@ -723,6 +1095,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    argv = list(argv) if argv is not None else sys.argv[1:]
+    if argv and argv[0] == "_repository":
+        if len(argv) != 3:
+            return 2
+
+        def logged_git(command, **kwargs):
+            print(f"$ {shlex.join(command)}", flush=True)
+            result = subprocess.run(command, **kwargs)
+            if result.stdout:
+                print(result.stdout, end="", flush=True)
+            if result.stderr:
+                print(result.stderr, end="", file=sys.stderr, flush=True)
+            return result
+
+        status = ensure_repository(Path(argv[1]), argv[2], logged_git)
+        print(json.dumps(status), flush=True)
+        return 1 if status["error"] else 0
     try:
         args = build_parser().parse_args(argv)
     except SystemExit as error:
@@ -733,8 +1122,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ROOT,
                 args.profile,
                 yes=args.yes,
-                argv=list(argv) if argv is not None else sys.argv[1:],
+                argv=argv,
                 enforce_tool_versions=args.enforce_tool_versions,
+                jobs=args.jobs,
+                progress_mode=args.progress,
+                verbose=args.verbose,
             )
         except (KeyError, OSError, ValueError) as error:
             print(f"Error: {error}", file=sys.stderr)

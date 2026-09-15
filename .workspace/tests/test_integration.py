@@ -1,4 +1,8 @@
+import asyncio
+import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import xknx_workspace as ws
@@ -296,6 +300,7 @@ def test_existing_knx_frontend_initializes_missing_submodule_without_upgrading_i
     assert (checkout / "homeassistant-frontend" / ".git").is_file()
     assert git("-C", checkout / "homeassistant-frontend", "rev-parse", "HEAD").stdout.strip() == pinned
 
+
     frontend_upstream = tmp_path / "frontend-upstream"
     commit(frontend_upstream, "newer frontend", "newer.txt")
     git("-C", frontend_upstream, "push")
@@ -303,3 +308,110 @@ def test_existing_knx_frontend_initializes_missing_submodule_without_upgrading_i
 
     assert result["error"] is None
     assert git("-C", checkout / "homeassistant-frontend", "rev-parse", "HEAD").stdout.strip() == pinned
+
+
+def test_fake_jobs_cap_concurrency_log_failures_and_resume_expected_artifacts(tmp_path: Path, monkeypatch) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    executable = bin_dir / "task4-fake"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import json, pathlib, sys, time\n"
+        "name, code, delay = sys.argv[1:]\n"
+        "with open('events', 'a') as out: out.write(json.dumps([name, 'start', time.monotonic()]) + '\\n')\n"
+        "print('working ' + name, flush=True)\n"
+        "time.sleep(float(delay))\n"
+        "with open('events', 'a') as out: out.write(json.dumps([name, 'end', time.monotonic()]) + '\\n')\n"
+        "if code == '0': pathlib.Path(name + '.done').touch()\n"
+        "sys.exit(int(code))\n"
+    )
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    jobs = [ws.Job(str(index), tmp_path, (["task4-fake", str(index), "1" if index == 1 else "0", "0.02" if index == 1 else "0.15"],)) for index in range(6)]
+    expected = {job.name: [tmp_path / f"{job.name}.done"] for job in jobs}
+    progress = ws.Progress("quiet", log_dir=tmp_path / ".state/logs")
+
+    results = asyncio.run(ws.run_jobs(jobs, progress=progress, expected=expected))
+
+    events = [json.loads(line) for line in (tmp_path / "events").read_text().splitlines()]
+    active = maximum = 0
+    for _, event, _ in sorted(events, key=lambda event: event[2]):
+        active += 1 if event == "start" else -1
+        maximum = max(maximum, active)
+    assert maximum == 3 and active == 0
+    assert {name for name, event, _ in events if event == "start"} == {"0", "1", "2"}
+    assert [result.status for result in results] == ["success", "error", "success", "skipped", "skipped", "skipped"]
+    assert len(list((tmp_path / ".state/logs").glob("*.log"))) == 3
+
+    (tmp_path / "events").unlink()
+    resumed = asyncio.run(ws.run_jobs([jobs[0], jobs[2]], progress=progress, expected=expected))
+    assert [result.status for result in resumed] == ["skipped", "skipped"]
+    assert all(result.returncode == 0 for result in resumed)
+    assert not (tmp_path / "events").exists()
+
+
+def test_job_runs_commands_sequentially_and_logs_a_missing_executable(tmp_path: Path) -> None:
+    progress = ws.Progress("quiet", log_dir=tmp_path / "logs")
+    command = [sys.executable, "-c", "import sys; print('before failure'); print('failure detail', file=sys.stderr); sys.exit(5)"]
+    job = ws.Job("sequence", tmp_path, (command, [sys.executable, "-c", "raise AssertionError('must not run')"]))
+    result = asyncio.run(ws.run_jobs([job], progress=progress))[0]
+    assert result.returncode == 5
+    log = next((tmp_path / "logs").glob("*.log")).read_text()
+    assert "before failure" in log and "failure detail" in log
+    assert "must not run" not in log
+    missing = ws.Job("missing", tmp_path, (["no-such-task4-executable"],))
+    assert asyncio.run(ws.run_jobs([missing], progress=progress))[0].returncode == 127
+    assert len(list((tmp_path / "logs").glob("*.log"))) == 2
+
+
+def test_cancellation_interrupts_then_terminates_and_logs_started_job(tmp_path: Path) -> None:
+    async def exercise():
+        command = [sys.executable, "-c", "import pathlib, signal, time; signal.signal(signal.SIGINT, lambda *args: pathlib.Path('interrupted').touch()); pathlib.Path('started').touch(); time.sleep(30)"]
+        plan = {"root": tmp_path, "tool_actions": [], "jobs": 1, "repository_jobs": [ws.Job("slow", tmp_path, (command,)), ws.Job("pending", tmp_path, (["must-not-run"],))], "project_setup_jobs": []}
+        execution = asyncio.create_task(ws.bootstrap_workspace(plan, ws.Progress("quiet", log_dir=tmp_path / "logs")))
+        async with asyncio.timeout(5):
+            while not (tmp_path / "started").exists():
+                await asyncio.sleep(0.01)
+        execution.cancel()
+        return await asyncio.wait_for(execution, 5)
+
+    assert asyncio.run(exercise()) == 130
+    assert (tmp_path / "interrupted").exists()
+    log = next((tmp_path / "logs").glob("*.log")).read_text()
+    assert "returncode: 130" in log
+    assert not list((tmp_path / "logs").glob("*pending*"))
+
+
+def test_repository_jobs_reuse_safe_git_updates_and_log_decisions(tmp_path: Path) -> None:
+    origin, upstream, checkout = create_checkout(tmp_path)
+    (checkout / "mine.txt").write_text("mine")
+    commit(upstream, "new upstream", "new.txt")
+    git("-C", upstream, "push")
+    before = git("-C", checkout, "rev-parse", "HEAD").stdout.strip()
+    jobs = ws.repository_jobs(tmp_path, {"xknx": str(origin)})
+    results = asyncio.run(ws.run_jobs(jobs, progress=ws.Progress("quiet", log_dir=tmp_path / "logs")))
+    assert all(result.returncode == 0 for result in results)
+    assert git("-C", checkout, "rev-parse", "HEAD").stdout.strip() == before
+    assert (checkout / "mine.txt").read_text() == "mine"
+    assert "unchanged" in next((tmp_path / "logs").glob("*.log")).read_text()
+
+
+def test_bootstrap_runs_prerequisites_before_local_repository_jobs_with_json_output(tmp_path: Path, monkeypatch, capsys) -> None:
+    origin, _, _ = create_checkout(tmp_path)
+    root = tmp_path / "workspace"
+    root.mkdir()
+    plan = [
+        {"kind": "context", "platform": "macos", "profile": "default", "repositories": ["xknx"], "settings": {}},
+        {"kind": "package", "command": [sys.executable, "-c", "from pathlib import Path; Path('prerequisite.done').touch(); print('ready')"]},
+    ]
+    monkeypatch.setattr(ws, "build_bootstrap_plan", lambda *args, **kwargs: plan)
+    monkeypatch.setitem(ws.REPOSITORIES, "xknx", str(origin))
+    assert ws.run_bootstrap(root, "default", yes=True, argv=["bootstrap", "--yes"], progress_mode="json") == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    tool_done = next(index for index, event in enumerate(events) if event["task"] == "tool-1" and event["status"] == "success")
+    repository_start = next(index for index, event in enumerate(events) if event["task"] == "xknx" and event["status"] == "running")
+    assert tool_done < repository_start
+    assert events[-1]["status"] == "summary" and "exit code 0" in events[-1]["detail"]
+    assert (root / "prerequisite.done").exists()
+    assert (root / "xknx/.git").exists()
+    assert len(list((root / ".state/logs").glob("*.log"))) == 2

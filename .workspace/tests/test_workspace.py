@@ -1,3 +1,5 @@
+import asyncio
+import builtins
 import json
 import subprocess
 from io import BytesIO
@@ -446,6 +448,13 @@ def test_reexec_accepts_completed_prerequisites_but_rejects_changed_intent(
     ]
     monkeypatch.setattr(ws, "load_settings", lambda *args: {"profile": "default"})
     monkeypatch.setattr(ws, "build_bootstrap_plan", lambda *args, **kwargs: current)
+    executions = []
+
+    async def execute(plan, progress):
+        executions.append(plan)
+        return 0
+
+    monkeypatch.setattr(ws, "bootstrap_workspace", execute)
     environ = {
         ws.CONFIRMED_PLAN_ENV: ws._serialized_plan(confirmed),
         ws.CONFIRMED_PLAN_DIGEST_ENV: ws.plan_digest(confirmed),
@@ -458,6 +467,9 @@ def test_reexec_accepts_completed_prerequisites_but_rejects_changed_intent(
         argv=["bootstrap", "default", "--yes"],
         environ=environ,
     ) == 0
+    assert {job.name for job in executions[0]["repository_jobs"]} == {
+        "home-assistant-core", "xknx", "xknxproject", "knx-telegram-store", "knx-frontend"
+    }
 
     current[0] = {**context, "profile": "docs", "repositories": ws.repositories_for("docs")}
     with pytest.raises(ValueError, match="confirmed bootstrap intent changed"):
@@ -543,3 +555,192 @@ def test_repository_row_contains_the_complete_git_observation() -> None:
         "error": None,
     }
     assert ws.repository_row(status) == "! xknx  feature/colors  dirty  ↑3 ↓1  unchanged"
+
+
+def test_scheduler_caps_jobs_and_finishes_running_work_after_failure(tmp_path: Path) -> None:
+    started = []
+    active = maximum = 0
+
+    async def run(job):
+        nonlocal active, maximum
+        started.append(job.name)
+        active += 1
+        maximum = max(maximum, active)
+        await asyncio.sleep(0.01 if job.name == "two" else 0.05)
+        active -= 1
+        return ws.Result(job.name, 1 if job.name == "two" else 0, 0.01)
+
+    jobs = [ws.Job(name, tmp_path, ([name],)) for name in ("one", "two", "three", "four")]
+    results = asyncio.run(ws.run_jobs(jobs, limit=2, progress=ws.Progress("quiet"), runner=run))
+    assert maximum == 2
+    assert started == ["one", "two"]
+    assert [(result.name, result.status) for result in results] == [
+        ("one", "success"), ("two", "error"), ("three", "skipped"), ("four", "skipped")
+    ]
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_scheduler_rejects_invalid_limits(tmp_path: Path, limit: int) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        asyncio.run(ws.run_jobs([], limit, ws.Progress("quiet")))
+
+
+def test_log_redacts_all_fields_and_keeps_unique_safe_paths(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("EXAMPLE_TOKEN", "env-secret")
+    monkeypatch.setenv("EXAMPLE_PASSWORD", "password-secret")
+    monkeypatch.setenv("EXAMPLE_SECRET", "other-secret")
+    monkeypatch.setenv("EXAMPLE_KEY", "key-secret")
+    monkeypatch.setenv("ORDINARY_VALUE", "not-recorded")
+    for _ in range(2):
+        ws.write_task_log(
+            tmp_path, "../../example", cwd=Path("/env-secret"),
+            command=["tool", "--token", "explicit-secret"],
+            stdout="env-secret password-secret", stderr="other-secret key-secret",
+            returncode=7, secrets={"explicit-secret"},
+            versions={"tool": "1.2"}, decisions=["keep env-secret"],
+        )
+    logs = list(tmp_path.glob("*.log"))
+    assert len(logs) == 2
+    for path in logs:
+        content = path.read_text()
+        for secret in ("env-secret", "password-secret", "other-secret", "key-secret", "explicit-secret", "not-recorded"):
+            assert secret not in content
+        for field in ("cwd:", "argv:", "start:", "end:", "duration:", "returncode: 7", "stdout:", "stderr:", "versions:", "decisions:", "***"):
+            assert field in content
+
+
+@pytest.mark.parametrize("mode", ["plain", "json", "quiet", "auto"])
+def test_non_tty_progress_never_imports_rich(mode: str, monkeypatch, capsys) -> None:
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name.startswith("rich"):
+            raise AssertionError("Rich must be lazy and TTY-only")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    progress = ws.Progress(mode, secrets={"private-value"})
+    progress.emit("xknx", "running", "Installing private-value")
+    progress.emit("xknx", "error", "first private-value")
+    progress.emit("other", "error", "second")
+    progress.emit("bootstrap", "summary", "finished")
+    progress.close()
+    output = capsys.readouterr().out
+    assert "private-value" not in output
+    assert "\x1b" not in output
+    if mode == "json":
+        assert json.loads(output.splitlines()[0]) == {
+            "task": "xknx", "status": "running", "detail": "Installing ***"
+        }
+    if mode == "quiet":
+        assert len(output.splitlines()) == 2
+        assert "first" in output and "finished" in output
+
+
+def test_auto_tty_falls_back_when_rich_is_missing(monkeypatch, capsys) -> None:
+    original_import = builtins.__import__
+    monkeypatch.setattr(ws.sys.stdout, "isatty", lambda: True)
+
+    def missing_rich(name, *args, **kwargs):
+        if name.startswith("rich"):
+            raise ImportError("Rich is not installed")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing_rich)
+    progress = ws.Progress("auto")
+    progress.emit("xknx", "running", "Installing")
+    progress.close()
+    assert "Installing" in capsys.readouterr().out
+
+
+def test_tty_updates_one_stable_row_per_task(capsys) -> None:
+    progress = ws.Progress("tty")
+    progress.emit("xknx", "running", "Installing")
+    progress.emit("xknx", "running", "Building")
+    progress.emit("frontend", "running", "Installing")
+    progress.emit("xknx", "success", "Done")
+    progress.close()
+    output = capsys.readouterr().out
+    assert output.count("xknx") == 1
+    assert "Done" in output and "Building" not in output
+
+
+def test_bootstrap_stops_phases_and_reports_dependent_jobs_skipped(tmp_path: Path, capsys) -> None:
+    async def not_called(plan, progress):
+        raise AssertionError("Dependent phase must not start")
+
+    plan = {
+        "root": tmp_path, "tool_actions": [], "jobs": 1,
+        "repository_jobs": [ws.Job("repository", tmp_path, (["missing-task4-command"],))],
+        "project_setup_jobs": [ws.Job("setup", tmp_path, (["must-not-run"],))],
+        "wire_home_assistant": not_called,
+        "smoke_default": not_called,
+    }
+    assert asyncio.run(ws.bootstrap_workspace(plan, ws.Progress("json", log_dir=tmp_path / "logs"))) == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert any(event["task"] == "setup" and event["status"] == "skipped" for event in events)
+    assert not any(event["task"] == "setup" and event["status"] == "running" for event in events)
+    assert {event["task"] for event in events if event["status"] == "skipped"} == {"setup", "wire_home_assistant", "smoke_default"}
+
+
+def test_bootstrap_empty_phases_succeed_and_only_enabled_callbacks_run(tmp_path: Path) -> None:
+    called = []
+
+    async def wire(plan, progress):
+        called.append("wire")
+        return True
+
+    async def smoke(plan, progress):
+        called.append("smoke")
+        return False
+
+    plan = {"root": tmp_path, "tool_actions": [], "repository_jobs": [], "project_setup_jobs": [], "jobs": 3}
+    assert asyncio.run(ws.bootstrap_workspace(plan, ws.Progress("quiet"))) == 0
+    plan.update(wire_home_assistant=wire, smoke_default=smoke)
+    assert asyncio.run(ws.bootstrap_workspace(plan, ws.Progress("quiet"))) == 1
+    assert called == ["wire", "smoke"]
+
+
+def test_bootstrap_forwards_execution_options(monkeypatch) -> None:
+    options = {}
+    monkeypatch.setattr(ws, "run_bootstrap", lambda *args, **kwargs: options.update(kwargs) or 0)
+    assert ws.main(["bootstrap", "--yes", "--jobs", "2", "--progress", "json", "--verbose"]) == 0
+    assert options["jobs"] == 2
+    assert options["progress_mode"] == "json"
+    assert options["verbose"] is True
+
+
+def test_tool_failure_reports_unstarted_actions_and_verification_in_its_log(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(ws, "inspect_tool", lambda name: {"installed": None})
+    actions = [
+        {"kind": "installer", "tool": "nvm", "command": ["install-nvm"], "version": "0.40.3"},
+        {"kind": "package", "command": ["must-not-run"]},
+    ]
+    progress = ws.Progress("json", log_dir=tmp_path / "logs")
+    results = asyncio.run(ws.run_tool_actions(
+        actions, progress, root=tmp_path,
+        command_runner=lambda command, **kwargs: CompletedProcess(command, 0),
+    ))
+    assert [(result.returncode, result.status) for result in results] == [(2, "error"), (1, "skipped")]
+    log = next((tmp_path / "logs").glob("*.log")).read_text()
+    assert "returncode: 2" in log and "NVM" in log
+    assert "must-not-run" not in log
+
+
+def test_log_redacts_secrets_that_need_json_escaping(tmp_path: Path) -> None:
+    secret = 'private"value\\end'
+    path = ws.write_task_log(tmp_path, "secret", command=["tool", secret], stdout=secret, stderr="", returncode=0, secrets={secret})
+    content = path.read_text()
+    assert secret not in content
+    assert json.dumps(secret)[1:-1] not in content
+
+
+def test_tty_plan_keeps_every_action_visible_before_confirmation(tmp_path: Path, monkeypatch) -> None:
+    plan = [{"kind": "package", "command": ["first-install"]}, {"kind": "installer", "command": ["second-install"]}]
+    monkeypatch.setattr(ws, "build_bootstrap_plan", lambda *args, **kwargs: plan)
+    frames = []
+    monkeypatch.setattr(ws.Progress, "_render_tty", lambda self: frames.append(dict(self.rows)))
+    assert ws.run_bootstrap(tmp_path, "default", yes=False, argv=["bootstrap"], input_fn=lambda prompt: "n", progress_mode="tty") == 1
+    planned = [detail for status, detail in frames[-1].values() if status == "planned"]
+    assert any("first-install" in detail for detail in planned)
+    assert any("second-install" in detail for detail in planned)
