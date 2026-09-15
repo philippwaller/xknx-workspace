@@ -41,8 +41,9 @@ them.
 - `./bootstrap` uses the prerequisite Python and uv to synchronize the locked
   `.workspace/uv.lock` environment before launching its CLI. This controller
   preparation is the only pre-confirmation mutation, and the first interactive
-  bootstrap screen is Rich. Daily `./dev` commands and help never synchronize
-  the controller environment; if it is missing, run `./bootstrap` first.
+  bootstrap screen is Rich. Daily `./dev` commands and `./dev` help never
+  synchronize the controller environment; if it is missing, run `./bootstrap`
+  first.
 - The default interactive plan hides raw commands; use `--verbose` to reveal
   them. Plain and JSON modes remain available for diagnostics.
 - Real KNX `secure_config_path` is a local file reference, not an installed
