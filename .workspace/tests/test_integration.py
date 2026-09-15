@@ -59,6 +59,21 @@ def test_multiline_secret_split_between_output_streams_keeps_common_words(tmp_pa
     assert "condition is on" in output
 
 
+def test_tty_job_keeps_subprocess_output_in_log_and_shows_the_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rendered = []
+    progress = ws.Progress("tty", log_dir=tmp_path / "logs")
+    monkeypatch.setattr(progress, "_render_tty", lambda: rendered.append(progress.rows["XKNX"]))
+    job = ws.Job("XKNX", tmp_path, ([sys.executable, "-c", "print('interleaved output')"],))
+
+    assert asyncio.run(ws.run_job(job, progress)).returncode == 0
+    assert rendered[0][1] == Path(sys.executable).name
+    assert not any("interleaved output" in row[1] for row in rendered)
+    assert rendered[-1][2] is not None
+    assert "interleaved output" in next((tmp_path / "logs").glob("*.log")).read_text()
+
+
 def test_cancellation_kills_descendants_after_direct_child_closes_pipes(tmp_path: Path) -> None:
     async def exercise():
         child = (

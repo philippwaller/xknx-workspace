@@ -197,16 +197,21 @@ class Progress:
         self.verbose = verbose
         self.versions = versions or {}
         self.decisions = decisions
-        self.rows: dict[str, tuple[str, str]] = {}
+        self.rows: dict[str, tuple[str, str, float | None]] = {}
         self.live = None
         self.first_error = False
+        self.first_failure: tuple[str, str] | None = None
         self.first_returncode = 0
 
-    def emit(self, task: str, status: str, detail: str) -> None:
+    def emit(self, task: str, status: str, detail: str, duration: float | None = None) -> None:
         task, detail = (redact(value, self.secrets) for value in (task, detail))
         detail = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))", "", detail)
         detail = " ".join(detail.splitlines())
-        self.rows[task] = (status, detail)
+        previous = self.rows.get(task)
+        self.rows[task] = (status, detail, duration)
+        if status == "error" and self.first_failure is None:
+            substep = f"{previous[1]} — " if previous and previous[0] == "running" else ""
+            self.first_failure = (task, f"{substep}{detail}")
         if self.mode == "tty":
             try:
                 self._render_tty()
@@ -220,20 +225,76 @@ class Progress:
         if status == "error":
             self.first_error = True
 
-    def _render_tty(self) -> None:
-        from rich.console import Console
-        from rich.live import Live
+    def _task_table(self):
+        from rich.spinner import Spinner
         from rich.table import Table
         from rich.text import Text
 
-        table = Table("Task", "Status", "Detail", expand=True)
-        for task, (status, detail) in self.rows.items():
-            table.add_row(Text(task), Text(status), Text(detail))
+        table = Table.grid(expand=True)
+        table.add_column(width=2)
+        table.add_column("Komponente", min_width=24, ratio=2)
+        table.add_column("Ergebnis", min_width=28, ratio=3)
+        table.add_column("Dauer", width=8, justify="right")
+        icons = {
+            "success": Text("✔", style="green"),
+            "error": Text("✘", style="red"),
+        }
+        for task, (status, detail, duration) in self.rows.items():
+            icon = Spinner("dots") if status == "running" else icons.get(status, Text("○", style="dim"))
+            table.add_row(icon, Text(task), Text(detail), Text(f"{duration:.1f}s" if duration is not None else ""))
+        return table
+
+    def _render_tty(self) -> None:
+        from rich.console import Console
+        from rich.live import Live
+
+        table = self._task_table()
         if self.live is None:
             self.live = Live(table, console=Console(file=sys.stdout), refresh_per_second=8)
             self.live.start()
         else:
             self.live.update(table)
+
+    def show_plan(self, lines: Sequence[str], *, profile: str, platform: str) -> None:
+        if self.mode == "tty":
+            try:
+                from rich.console import Console
+                from rich.live import Live
+                from rich.panel import Panel
+                from rich.text import Text
+
+                panel = Panel(Text("\n".join(lines)), title=f"XKNX Workspace · {platform} · {profile}")
+                self.live = Live(panel, console=Console(file=sys.stdout), refresh_per_second=8)
+                self.live.start()
+                return
+            except ImportError:
+                self.mode = "plain"
+        for index, line in enumerate(lines):
+            self.emit(f"plan-{index + 1}", "planned", line)
+
+    def finish(self, returncode: int, *, profile: str, urls: Sequence[str] = ()) -> None:
+        if self.mode != "tty":
+            self.emit("bootstrap", "summary", f"Finished with exit code {returncode}; logs: {self.log_dir}")
+            return
+        self.close()
+        if returncode:
+            task, detail = self.first_failure or ("bootstrap", f"Exit {returncode}")
+            self._render_summary_tty(
+                [f"{task}: {detail}", f"Retry: ./bootstrap {profile}"], error=True
+            )
+        else:
+            self._render_summary_tty(
+                [f"Profile {profile} is ready", f"Start: ./dev start {profile}", f"Tmux: {TMUX_SESSION}", *urls],
+                error=False,
+            )
+
+    def _render_summary_tty(self, lines: Sequence[str], error: bool) -> None:
+        from rich.console import Console
+        from rich.panel import Panel
+
+        Console(file=sys.stdout).print(
+            Panel("\n".join(lines), title="Bootstrap failed" if error else "Bootstrap complete", border_style="red" if error else "green")
+        )
 
     def close(self) -> None:
         if self.live is not None:
@@ -302,7 +363,7 @@ async def run_job(job: Job, progress: Progress, *, command_runner=None, verify=N
                 boundary = len(pending)
             lines, pending = pending[:boundary].replace("\r", "\n").split("\n"), pending[boundary:]
             for line in lines:
-                if line.strip():
+                if line.strip() and progress.mode != "tty":
                     progress.emit(job.name, "running", line if progress.verbose else line[-500:])
             if not chunk:
                 break
@@ -310,7 +371,10 @@ async def run_job(job: Job, progress: Progress, *, command_runner=None, verify=N
     try:
         for command in job.commands:
             commands.append(command)
-            progress.emit(job.name, "running", f"$ {display_command(command, progress.secrets)}")
+            progress.emit(
+                job.name, "running",
+                Path(command[0]).name if progress.mode == "tty" else f"$ {display_command(command, progress.secrets)}",
+            )
             if command_runner is not None:
                 result = command_runner(command, cwd=job.cwd, capture_output=True, text=True, check=False, **({"env": env} if env is not None else {}))
                 stdout.append(result.stdout or "")
@@ -353,7 +417,7 @@ async def run_job(job: Job, progress: Progress, *, command_runner=None, verify=N
             start=start, duration=duration, secrets=progress.secrets,
             versions=progress.versions, decisions=progress.decisions,
         )
-        progress.emit(job.name, "success" if returncode == 0 else "error", f"Exit {returncode} after {duration:.2f}s; log: {path}")
+        progress.emit(job.name, "success" if returncode == 0 else "error", f"Exit {returncode}; log: {path}", duration=duration)
     return Result(job.name, returncode, duration)
 
 
@@ -514,7 +578,7 @@ async def bootstrap_workspace(plan: dict[str, object], progress: Progress) -> in
             progress.emit(job.name, "skipped", "A prerequisite failed or was interrupted")
         for name in sorted(pending_callbacks):
             progress.emit(name, "skipped", "A prerequisite failed or was interrupted")
-        progress.emit("bootstrap", "summary", f"Finished with exit code {code}; logs: {progress.log_dir}")
+        progress.finish(code, profile=str(plan.get("profile", "default")), urls=plan.get("urls", ()))
 
 
 def detect_platform(os_release: str | None = None, uname: str | None = None) -> str:
@@ -1434,22 +1498,25 @@ def build_bootstrap_plan(
     return plan
 
 
-def render_plan(plan: Sequence[Mapping[str, object]], print_fn=print, *, secrets: set[str] | None = None) -> None:
+def render_plan(
+    plan: Sequence[Mapping[str, object]], print_fn=print, *,
+    secrets: set[str] | None = None, verbose: bool = False,
+) -> None:
     for item in plan:
-        if command := item.get("command"):
-            label = f"{item['kind']}: " if item.get("kind") in {"wiring", "smoke"} else ""
-            print_fn(f"{label}$ {display_command(command, secrets)}")
-            if lifecycle := item.get("lifecycle"):
-                print_fn(lifecycle)
-        elif item.get("kind") == "context":
+        kind = item.get("kind")
+        if kind == "context":
             print_fn(f"Platform: {item['platform']}  Profile: {item['profile']}")
-            print_fn(f"Repositories: {', '.join(item['repositories'])}")
-        elif item.get("kind") == "tool":
+            repositories = item["repositories"]
+            print_fn(f"Repositories: {len(repositories)} repositories — {', '.join(repositories)}")
+        elif kind == "tool":
             print_fn(f"Tool {item['tool']}: {item.get('installed') or 'unavailable'}" + (f"; requires >= {item['minimum']} ({item['relation']})" if item.get("minimum") else ""))
-        elif item.get("kind") == "setup":
-            for command in item["commands"]:
-                print_fn(f"Setup {item['name']} ({item['cwd']}): $ {display_command(command, secrets)}")
-        elif item.get("kind") == "configuration":
+        elif kind == "setup":
+            commands = item["commands"]
+            print_fn(f"Setup {item['name']}: {len(commands)} command{'s' if len(commands) != 1 else ''}")
+            if verbose:
+                for command in commands:
+                    print_fn(f"  {item['cwd']}: $ {display_command(command, secrets)}")
+        elif kind == "configuration":
             print_fn(f"{str(item['action']).capitalize()} local configuration: {item['path']}")
             verb = "Reuse existing" if item["reuse_config"] else "Create"
             print_fn(f"{verb} Home Assistant config: {item['config_dir']} (expected port {item['port']})")
@@ -1461,9 +1528,17 @@ def render_plan(plan: Sequence[Mapping[str, object]], print_fn=print, *, secrets
         elif item.get("level") in {"warning", "info"}:
             label = "Docker (optional): " if item.get("tool") == "docker" else ""
             print_fn(f"{str(item['level']).upper()}: {label}{item.get('message') or item.get('link', '')}")
-        elif item.get("kind") == "manual":
+        elif kind == "manual":
             tools = item.get("tools") or (item["tool"],)
-            print_fn(f"MANUAL: install {', '.join(tools)} — {item['link']}")
+            print_fn(f"MANUAL: install {', '.join(tools)}" + (f" — {item['link']}" if item.get("link") else ""))
+        elif kind == "wiring":
+            print_fn("Wiring: install local packages into Home Assistant")
+        elif kind == "smoke":
+            print_fn("Smoke test: verify Home Assistant imports and readiness")
+            if lifecycle := item.get("lifecycle"):
+                print_fn(lifecycle)
+        if verbose and (command := item.get("command")):
+            print_fn(f"{kind}: $ {display_command(command, secrets)}")
 
 
 def run_bootstrap(
@@ -1503,9 +1578,13 @@ def run_bootstrap(
     }
     try:
         lines = []
-        render_plan(plan, lines.append, secrets=progress.secrets)
-        for index, line in enumerate(lines):
-            progress.emit(f"plan-{index + 1}", "planned", line)
+        render_plan(
+            plan, lines.append, secrets=progress.secrets,
+            verbose=verbose or progress.mode != "tty",
+        )
+        progress.show_plan(lines, profile=profile, platform=str(context.get("platform", "unknown")))
+        progress.close()
+        progress.rows.clear()
         if yes and configuration and configuration["reuse_config"] and not configuration["explicit_config"]:
             raise ValueError("home_assistant.config_dir already exists; confirm reuse interactively or explicitly select its absolute path with XKNX_HA_CONFIG_DIR")
         if not yes:
@@ -1517,6 +1596,10 @@ def run_bootstrap(
             if input_fn(prompt).strip().lower() not in {"y", "yes"}:
                 progress.emit("bootstrap", "summary", "Plan declined")
                 return 1
+        execution["urls"] = (
+            f"http://127.0.0.1:{settings.get('home_assistant', {}).get('port', 8123)}/",
+            *(DOCS_URLS.values() if profile in {"docs", "all"} else ()),
+        )
         return asyncio.run(bootstrap_workspace(execution, progress))
     except KeyboardInterrupt:
         progress.emit("bootstrap", "summary", "Interrupted; exit code 130")

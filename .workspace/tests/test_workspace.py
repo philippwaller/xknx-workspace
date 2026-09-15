@@ -225,6 +225,20 @@ def test_missing_package_source_guidance_renders_all_tools_and_link() -> None:
     assert lines == ["MANUAL: install git, uv — https://brew.sh/"]
 
 
+def test_default_plan_is_compact_and_verbose_plan_reveals_commands() -> None:
+    plan = [
+        {"kind": "context", "platform": "macos", "profile": "default", "repositories": ("a", "b", "c", "d", "e")},
+        {"kind": "setup", "name": "XKNX", "cwd": "/workspace/xknx", "commands": (["uv", "sync"],)},
+    ]
+    compact: list[str] = []
+    verbose: list[str] = []
+    ws.render_plan(plan, compact.append, verbose=False)
+    ws.render_plan(plan, verbose.append, verbose=True)
+    assert not any("$ " in line for line in compact)
+    assert any("5 repositories" in line for line in compact)
+    assert any("$ " in line for line in verbose)
+
+
 def test_missing_nvm_is_blocking_and_never_resolves_or_runs_an_installer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -742,6 +756,45 @@ def test_tty_updates_one_stable_row_per_task(capsys) -> None:
     output = capsys.readouterr().out
     assert output.count("xknx") == 1
     assert "Done" in output and "Building" not in output
+
+
+def test_tty_rows_use_fixed_component_result_and_duration_columns(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    progress = ws.Progress("tty")
+    progress.emit("XKNX", "running", "Installiert Abhängigkeiten")
+    progress.emit("Home Assistant Core", "success", "Eingerichtet", duration=42.1)
+    table = progress._task_table()
+    assert [column.header for column in table.columns] == ["", "Komponente", "Ergebnis", "Dauer"]
+    assert table.columns[2].min_width > 0
+    assert table.columns[3].justify == "right"
+
+
+def test_running_output_reuses_result_cell_without_detail_rows() -> None:
+    progress = ws.Progress("tty")
+    progress.emit("XKNX", "running", "Installiert Abhängigkeiten")
+    progress.emit("XKNX", "running", "Prüft Installation")
+    assert list(progress.rows) == ["XKNX"]
+    assert progress.rows["XKNX"][1] == "Prüft Installation"
+
+
+def test_finish_renders_actionable_failure_and_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    rendered: list[str] = []
+    progress = ws.Progress("tty")
+    monkeypatch.setattr(progress, "_render_summary_tty", lambda lines, error: rendered.extend(lines))
+    progress.emit("KNX Frontend", "error", "Exit 3; log: /workspace/.state/logs/frontend.log")
+    progress.finish(3, profile="default")
+    assert "KNX Frontend" in " ".join(rendered)
+    assert "Exit 3" in " ".join(rendered)
+    assert "/workspace/.state/logs/frontend.log" in " ".join(rendered)
+    assert "./bootstrap default" in " ".join(rendered)
+
+    rendered.clear()
+    progress = ws.Progress("tty")
+    monkeypatch.setattr(progress, "_render_summary_tty", lambda lines, error: rendered.extend(lines))
+    progress.finish(0, profile="default", urls=("http://localhost:8123",))
+    assert "./dev start default" in " ".join(rendered)
+    assert "http://localhost:8123" in " ".join(rendered)
 
 
 def test_bootstrap_stops_phases_and_reports_dependent_jobs_skipped(tmp_path: Path, capsys) -> None:
