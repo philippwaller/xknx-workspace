@@ -524,6 +524,9 @@ def test_reexec_rejects_a_new_unconfirmed_action(
 )
 def test_main_accepts_the_public_command_surface(argv: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ws, "run_bootstrap", lambda *args, **kwargs: 0, raising=False)
+    monkeypatch.setattr(ws, "start_tmux_command_or_message", lambda *args, **kwargs: {"returncode": 0})
+    monkeypatch.setattr(ws, "tmux_status", lambda: {"session": "xknx-dev", "running": False, "windows": []})
+    monkeypatch.setattr(ws, "stop_tmux", lambda: 0)
     assert ws.main(argv) == 0
 
 
@@ -833,10 +836,37 @@ def test_home_assistant_wiring_and_start_use_ha_python_and_root_checkouts(tmp_pa
         "-e", f"{tmp_path / 'knx-telegram-store'}[sqlite,postgres]", "-e", str(tmp_path / "knx-frontend"),
     ]
     assert ws.home_assistant_command(Path("."), {"port": 9123, "config_dir": "home-assistant-core/config"}) == [
-        str(tmp_path / "home-assistant-core/.venv/bin/python"), "-m", "homeassistant",
+        str(tmp_path / "home-assistant-core/.venv/bin/hass"),
         "--config", str(tmp_path / "home-assistant-core/config"), "--skip-pip-packages",
         "xknx,xknxproject,knx-frontend,knx-telegram-store",
     ]
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected"),
+    [
+        ("default", ("overview", "home-assistant", "knx-frontend")),
+        ("frontend", ("overview", "home-assistant", "knx-frontend", "home-assistant-frontend")),
+        ("toolkit", ("overview", "home-assistant", "knx-frontend", "toolkit")),
+        ("docs", ("overview", "home-assistant", "knx-frontend", "xknx-docs", "ha-docs")),
+        ("all", ("overview", "home-assistant", "knx-frontend", "home-assistant-frontend", "toolkit", "xknx-docs", "ha-docs")),
+    ],
+)
+def test_tmux_windows(profile: str, expected: tuple[str, ...]) -> None:
+    assert tuple(ws.tmux_windows(profile)) == expected
+
+
+def test_non_tty_start_does_not_create_hidden_session(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    monkeypatch.setattr(ws.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(ws.sys.stdout, "isatty", lambda: False)
+
+    result = ws.start_tmux_command_or_message(
+        "default",
+        runner=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("tmux must not run")),
+    )
+
+    assert result["action"] == "print-command"
+    assert capsys.readouterr().out == "./dev start default\n"
 
 
 @pytest.mark.parametrize("port", [0, 65536, True, "8123"])

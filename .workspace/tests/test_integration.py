@@ -889,3 +889,99 @@ def test_custom_config_bootstrap_never_touches_late_fixed_config(tmp_path: Path,
     assert not (core / "setup.started").exists()
     assert (fixed / "configuration.yaml").read_text() == "developer-owned\n"
     assert (custom / "configuration.yaml").read_text() == "default_config:\nhttp:\n  server_port: 8123\n"
+
+
+def fake_tmux(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    events = tmp_path / "tmux-events.jsonl"
+    state = tmp_path / "tmux-session"
+    executable = bin_dir / "tmux"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, pathlib, sys\n"
+        "events = pathlib.Path(os.environ['FAKE_TMUX_EVENTS'])\n"
+        "state = pathlib.Path(os.environ['FAKE_TMUX_STATE'])\n"
+        "with events.open('a') as output: output.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "command = sys.argv[1]\n"
+        "if command == 'has-session': raise SystemExit(0 if state.exists() else 1)\n"
+        "if command == 'new-session': state.touch()\n"
+        "elif command == 'list-windows': print(os.environ.get('FAKE_TMUX_WINDOWS', ''))\n"
+        "elif command == 'kill-session': state.unlink()\n"
+    )
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_TMUX_EVENTS", str(events))
+    monkeypatch.setenv("FAKE_TMUX_STATE", str(state))
+    return events, state
+
+
+def tmux_events(path: Path) -> list[list[str]]:
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def test_existing_tmux_session_attaches_without_restarting_windows(tmp_path: Path, monkeypatch) -> None:
+    events, state = fake_tmux(tmp_path, monkeypatch)
+    state.touch()
+
+    result = ws.start_tmux_command_or_message("all", root=tmp_path, settings=ws.load_settings(tmp_path, {}), interactive=True)
+
+    assert result["action"] == "attach"
+    assert tmux_events(events) == [
+        ["has-session", "-t", "xknx-dev"],
+        ["attach-session", "-t", "xknx-dev"],
+    ]
+
+
+def test_new_tmux_session_creates_only_selected_visible_process_windows(tmp_path: Path, monkeypatch) -> None:
+    events, _ = fake_tmux(tmp_path, monkeypatch)
+
+    result = ws.start_tmux_command_or_message("docs", root=tmp_path, settings=ws.load_settings(tmp_path, {}), interactive=True)
+
+    assert result["action"] == "create-and-attach"
+    calls = tmux_events(events)
+    assert calls[0] == ["has-session", "-t", "xknx-dev"]
+    assert calls[-1] == ["attach-session", "-t", "xknx-dev"]
+    creations = [call for call in calls if call[0] in {"new-session", "new-window"}]
+    assert [call[call.index("-n") + 1] for call in creations] == [
+        "overview", "home-assistant", "knx-frontend", "xknx-docs", "ha-docs"
+    ]
+    assert [call[call.index("-c") + 1] for call in creations] == [
+        str(tmp_path),
+        str(tmp_path / "home-assistant-core"),
+        str(tmp_path / "knx-frontend"),
+        str(tmp_path / "xknx/docs"),
+        str(tmp_path / "home-assistant.io"),
+    ]
+    process_shells = [call[-1] for call in creations[1:]]
+    assert str(tmp_path / "home-assistant-core/.venv/bin/hass") in process_shells[0]
+    assert "--skip-pip-packages" in process_shells[0]
+    assert "exec \"$SHELL\" -l" in process_shells[0]
+    assert all("nohup" not in command and "&" not in command.replace("&&", "") and ".pid" not in command for command in process_shells)
+    assert not list(tmp_path.glob("*.pid")) and not list((tmp_path / ".state").glob("*.pid"))
+
+
+def test_tmux_status_is_read_only_and_stop_only_kills_an_existing_session(tmp_path: Path, monkeypatch, capsys) -> None:
+    events, state = fake_tmux(tmp_path, monkeypatch)
+    state.touch()
+    monkeypatch.setenv("FAKE_TMUX_WINDOWS", "overview\t0\tzsh\t\nhome-assistant\t1\tpython\t7")
+
+    status = ws.tmux_status()
+    assert status == {
+        "session": "xknx-dev",
+        "running": True,
+        "windows": [
+            {"name": "overview", "dead": False, "command": "zsh", "exit_code": None},
+            {"name": "home-assistant", "dead": True, "command": "python", "exit_code": 7},
+        ],
+    }
+    assert ws.stop_tmux() == 0
+    assert "Stopped tmux session xknx-dev." in capsys.readouterr().out
+    assert ws.stop_tmux() == 0
+    assert tmux_events(events) == [
+        ["has-session", "-t", "xknx-dev"],
+        ["list-windows", "-t", "xknx-dev", "-F", "#{window_name}\t#{pane_dead}\t#{pane_current_command}\t#{pane_dead_status}"],
+        ["has-session", "-t", "xknx-dev"],
+        ["kill-session", "-t", "xknx-dev"],
+        ["has-session", "-t", "xknx-dev"],
+    ]

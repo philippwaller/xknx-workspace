@@ -93,6 +93,8 @@ NODE_REPOSITORIES = {"home-assistant-frontend", "knx-frontend", "xknxtoolkit", "
 CONFIRMED_PLAN_ENV = "XKNX_WORKSPACE_CONFIRMED_PLAN"
 CONFIRMED_PLAN_DIGEST_ENV = "XKNX_WORKSPACE_CONFIRMED_PLAN_SHA256"
 NVM_RELEASE_API = "https://api.github.com/repos/nvm-sh/nvm/releases/latest"
+TMUX_SESSION = "xknx-dev"
+TMUX_STATUS_FORMAT = "#{window_name}\t#{pane_dead}\t#{pane_current_command}\t#{pane_dead_status}"
 
 
 @dataclass
@@ -645,12 +647,12 @@ def project_development_jobs(root: Path, profile: str) -> list[Job]:
         "xknxtoolkit": ("toolkit", ["uv", "run", "python", "-m", "knx_gui.main"]),
         "home-assistant.io": ("ha-docs", ["bundle", "exec", "rake", "preview"]),
     }
-    jobs = [
-        Job(adapters[name][0], root.resolve() / name, (adapters[name][1],))
-        for name in repositories_for(profile) if name in adapters
-    ]
-    if profile in {"docs", "all"}:
-        jobs.append(Job("xknx-docs", root.resolve() / "xknx/docs", (["bundle", "exec", "jekyll", "serve"],)))
+    jobs = []
+    for name in repositories_for(profile):
+        if name == "home-assistant.io":
+            jobs.append(Job("xknx-docs", root.resolve() / "xknx/docs", (["bundle", "exec", "jekyll", "serve"],)))
+        if name in adapters:
+            jobs.append(Job(adapters[name][0], root.resolve() / name, (adapters[name][1],)))
     return jobs
 
 
@@ -666,10 +668,122 @@ def home_assistant_wiring_command(root: Path) -> list[str]:
 def home_assistant_command(root: Path, settings: Mapping[str, object]) -> list[str]:
     root = root.resolve()
     return [
-        str(root / "home-assistant-core/.venv/bin/python"), "-m", "homeassistant",
+        str(root / "home-assistant-core/.venv/bin/hass"),
         "--config", str((root / str(settings["config_dir"])).resolve()),
         "--skip-pip-packages", "xknx,xknxproject,knx-frontend,knx-telegram-store",
     ]
+
+
+def tmux_windows(profile: str) -> tuple[str, ...]:
+    return (
+        "overview",
+        "home-assistant",
+        *(job.name for job in project_development_jobs(ROOT, profile)),
+    )
+
+
+def _tmux_session_exists(runner=subprocess.run) -> bool:
+    return runner(
+        ["tmux", "has-session", "-t", TMUX_SESSION],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).returncode == 0
+
+
+def _tmux_process_shell(command: Sequence[str]) -> str:
+    return (
+        f"{shlex.join(command)}; status=$?; "
+        '[ "$status" -eq 0 ] || { printf \'\\nProcess exited with status %s.\\n\' "$status"; exec "$SHELL" -l; }'
+    )
+
+
+def start_tmux_command_or_message(
+    profile: str,
+    *,
+    root: Path = ROOT,
+    settings: Mapping[str, object] | None = None,
+    runner=subprocess.run,
+    interactive: bool | None = None,
+    print_fn=print,
+) -> dict[str, object]:
+    repositories_for(profile)
+    interactive = sys.stdin.isatty() and sys.stdout.isatty() if interactive is None else interactive
+    if not interactive:
+        print_fn(f"./dev start {profile}")
+        return {"action": "print-command", "returncode": 0}
+    if _tmux_session_exists(runner):
+        result = runner(["tmux", "attach-session", "-t", TMUX_SESSION], check=False)
+        return {"action": "attach", "returncode": result.returncode}
+
+    root = root.resolve()
+    settings = settings or load_settings(root)
+    ha_settings = settings["home_assistant"]
+    if not isinstance(ha_settings, Mapping):
+        raise ValueError("home_assistant must be a TOML table")
+    jobs = [
+        Job("home-assistant", root / "home-assistant-core", (home_assistant_command(root, ha_settings),)),
+        *project_development_jobs(root, profile),
+    ]
+    commands = [["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-n", "overview", "-c", str(root)]]
+    commands.extend(
+        [
+            "tmux", "new-window", "-d", "-t", f"{TMUX_SESSION}:",
+            "-n", job.name, "-c", str(job.cwd), _tmux_process_shell(job.commands[0]),
+        ]
+        for job in jobs
+    )
+    for command in commands:
+        result = runner(command, check=False)
+        if result.returncode:
+            return {"action": "error", "returncode": result.returncode}
+    result = runner(["tmux", "attach-session", "-t", TMUX_SESSION], check=False)
+    return {"action": "create-and-attach", "returncode": result.returncode}
+
+
+def tmux_status(runner=subprocess.run) -> dict[str, object]:
+    if not _tmux_session_exists(runner):
+        return {"session": TMUX_SESSION, "running": False, "windows": []}
+    result = runner(
+        ["tmux", "list-windows", "-t", TMUX_SESSION, "-F", TMUX_STATUS_FORMAT],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        return {"session": TMUX_SESSION, "running": False, "windows": [], "error": result.stderr.strip()}
+    windows = []
+    for line in result.stdout.splitlines():
+        name, dead, command, exit_code = line.split("\t", 3)
+        windows.append({
+            "name": name,
+            "dead": dead == "1",
+            "command": command,
+            "exit_code": int(exit_code) if exit_code else None,
+        })
+    return {"session": TMUX_SESSION, "running": True, "windows": windows}
+
+
+def stop_tmux(runner=subprocess.run, print_fn=print) -> int:
+    if not _tmux_session_exists(runner):
+        print_fn(f"tmux session {TMUX_SESSION} is not running.")
+        return 0
+    result = runner(["tmux", "kill-session", "-t", TMUX_SESSION], check=False)
+    if result.returncode == 0:
+        print_fn(f"Stopped tmux session {TMUX_SESSION}.")
+    return result.returncode
+
+
+def print_tmux_status(status: Mapping[str, object], format: str, print_fn=print) -> None:
+    if format == "json":
+        print_fn(json.dumps(status))
+        return
+    if not status["running"]:
+        print_fn(f"tmux session {status['session']} is not running.")
+        return
+    for window in status["windows"]:
+        state = f"exited ({window['exit_code']})" if window["dead"] else f"running {window['command']}"
+        print_fn(f"{window['name']}: {state}")
 
 
 def configuration_action(root: Path, settings: Mapping[str, object]) -> dict[str, object]:
@@ -1431,6 +1545,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 verbose=args.verbose,
             )
         except (KeyError, OSError, ValueError) as error:
+            print(f"Error: {error}", file=sys.stderr)
+            return 2
+    if args.dev_command == "start":
+        try:
+            return int(start_tmux_command_or_message(args.profile, root=ROOT)["returncode"])
+        except (KeyError, OSError, ValueError) as error:
+            print(f"Error: {error}", file=sys.stderr)
+            return 2
+    if args.dev_command == "status":
+        try:
+            status = tmux_status()
+            print_tmux_status(status, args.format)
+            return 0 if "error" not in status else 1
+        except (OSError, ValueError) as error:
+            print(f"Error: {error}", file=sys.stderr)
+            return 2
+    if args.dev_command == "stop":
+        try:
+            return stop_tmux()
+        except OSError as error:
             print(f"Error: {error}", file=sys.stderr)
             return 2
     return 0
