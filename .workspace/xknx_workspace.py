@@ -84,6 +84,7 @@ PACKAGE_SOURCE_LINKS = {
 NODE_REPOSITORIES = {"home-assistant-frontend", "knx-frontend", "xknxtoolkit", "home-assistant.io"}
 CONFIRMED_PLAN_ENV = "XKNX_WORKSPACE_CONFIRMED_PLAN"
 CONFIRMED_PLAN_DIGEST_ENV = "XKNX_WORKSPACE_CONFIRMED_PLAN_SHA256"
+NVM_RELEASE_API = "https://api.github.com/repos/nvm-sh/nvm/releases/latest"
 
 
 def detect_platform(os_release: str | None = None, uname: str | None = None) -> str:
@@ -169,17 +170,22 @@ def nvm_install_action(tag: str) -> dict[str, object]:
         "command": [
             "sh",
             "-c",
-            f"curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/{tag}/install.sh | PROFILE=/dev/null bash",
+            'tmp=$(mktemp) && trap \'rm -f "$tmp"\' EXIT && '
+            "curl -fsS --location --max-redirs 0 --proto '=https' "
+            f'-o "$tmp" https://raw.githubusercontent.com/nvm-sh/nvm/{tag}/install.sh && '
+            'PROFILE=/dev/null bash "$tmp"',
         ],
     }
 
 
 def resolve_nvm_release(opener=urllib.request.urlopen) -> str:
     request = urllib.request.Request(
-        "https://api.github.com/repos/nvm-sh/nvm/releases/latest",
+        NVM_RELEASE_API,
         headers={"Accept": "application/vnd.github+json"},
     )
     with opener(request, timeout=10) as response:
+        if response.geturl() != NVM_RELEASE_API:
+            raise ValueError(f"redirected NVM release API: {response.geturl()}")
         tag = json.loads(response.read())["tag_name"]
     if not isinstance(tag, str) or not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
         raise ValueError(f"invalid NVM release: {tag}")
@@ -267,36 +273,45 @@ def inspect_docker(platform: str) -> dict[str, object]:
 def docs_prerequisite_actions(root: Path, profile: str) -> list[dict[str, object]]:
     if profile not in {"docs", "all"}:
         return []
-    paths = (root / "xknx/docs/.ruby-version", root / "home-assistant.io/.ruby-version")
-    if not all(path.is_file() for path in paths):
-        return [
-            {
-                "kind": "diagnostic",
-                "level": "warning",
-                "scope": "docs",
-                "blocking": True,
-                "message": "Ruby versions will be checked after the documentation repositories are available.",
-            }
-        ]
-    versions = tuple(dict.fromkeys(path.read_text().strip().lstrip("v") for path in paths))
-    expected = versions[0] if len(versions) == 1 else ", ".join(versions)
-    ruby = inspect_tool("ruby", expected if len(versions) == 1 else None)
-    bundler = inspect_tool("bundle")
+    requirements = (
+        ("xknx/docs", root / "xknx/docs/.ruby-version"),
+        ("home-assistant.io", root / "home-assistant.io/.ruby-version"),
+    )
     actions: list[dict[str, object]] = []
-    if ruby["installed"] not in versions:
-        actions.append(
-            {
-                "kind": "manual",
-                "tool": "ruby",
-                "command": [],
-                "expected": expected,
-                "scope": "docs",
-                "blocking": True,
-                "link": "https://www.ruby-lang.org/en/documentation/installation/",
-            }
+    ruby = inspect_tool("ruby") if any(path.is_file() for _, path in requirements) else None
+    for repository, path in requirements:
+        if not path.is_file():
+            actions.append(
+                {
+                    "kind": "diagnostic",
+                    "level": "warning",
+                    "repository": repository,
+                    "scope": "docs",
+                    "blocking": True,
+                    "message": f"Ruby will be checked after {repository} is available.",
+                }
+            )
+            continue
+        expected = path.read_text().strip().lstrip("v")
+        decision = version_decision(
+            "ruby", ruby["installed"] if ruby and isinstance(ruby["installed"], str) else None, expected, False
         )
-    else:
-        actions.append({**ruby, "scope": "docs"})
+        if decision["relation"] == "current":
+            actions.append({**ruby, **decision, "repository": repository, "scope": "docs"})
+        else:
+            actions.append(
+                {
+                    "kind": "manual",
+                    "tool": "ruby",
+                    "command": [],
+                    **decision,
+                    "repository": repository,
+                    "scope": "docs",
+                    "blocking": True,
+                    "link": "https://www.ruby-lang.org/en/documentation/installation/",
+                }
+            )
+    bundler = inspect_tool("bundle")
     if bundler["executable"] is None:
         actions.append(
             {
@@ -331,6 +346,7 @@ def build_bootstrap_plan(
             "profile": profile,
             "repositories": repositories,
             "settings": settings,
+            "enforce_tool_versions": enforce_tool_versions,
         }
     ]
     tool_states = [inspect_tool(name) for name in ("git", "uv", "tmux")]
@@ -370,6 +386,39 @@ def validate_plan_digest(plan: Sequence[Mapping[str, object]], digest: str) -> N
         raise ValueError("confirmed plan changed before execution")
 
 
+def _package_parts(command: object) -> tuple[tuple[str, ...], set[str]] | None:
+    if not isinstance(command, list):
+        return None
+    for prefix in (("brew", "install"), ("sudo", "apt-get", "install", "-y")):
+        if tuple(command[: len(prefix)]) == prefix:
+            return prefix, set(command[len(prefix) :])
+    return None
+
+
+def validate_reexec_plan(
+    confirmed: Sequence[Mapping[str, object]], current: Sequence[Mapping[str, object]]
+) -> None:
+    confirmed_context = next((item for item in confirmed if item.get("kind") == "context"), None)
+    current_context = next((item for item in current if item.get("kind") == "context"), None)
+    if _serialized_plan([confirmed_context]) != _serialized_plan([current_context]):
+        raise ValueError("confirmed bootstrap intent changed before re-exec")
+    confirmed_actions = [item for item in confirmed if item.get("kind") in {"package", "installer"}]
+    for action in (item for item in current if item.get("kind") in {"package", "installer"}):
+        if action in confirmed_actions:
+            continue
+        current_package = _package_parts(action.get("command")) if action.get("kind") == "package" else None
+        if current_package and any(
+            confirmed_package
+            and current_package[0] == confirmed_package[0]
+            and current_package[1] <= confirmed_package[1]
+            for candidate in confirmed_actions
+            if candidate.get("kind") == "package"
+            for confirmed_package in [_package_parts(candidate.get("command"))]
+        ):
+            continue
+        raise ValueError("re-exec introduced an unconfirmed prerequisite action")
+
+
 def render_plan(plan: Sequence[Mapping[str, object]], print_fn=print) -> None:
     for item in plan:
         if command := item.get("command"):
@@ -400,7 +449,13 @@ def run_bootstrap(
     if marker or carried:
         if not marker or not carried:
             raise ValueError("incomplete confirmed plan marker")
-        validate_plan_digest(json.loads(carried), marker)
+        confirmed_plan = json.loads(carried)
+        validate_plan_digest(confirmed_plan, marker)
+        settings = load_settings(root, environ)
+        current_plan = build_bootstrap_plan(
+            root, profile, settings, enforce_tool_versions=enforce_tool_versions
+        )
+        validate_reexec_plan(confirmed_plan, current_plan)
         return 0
     settings = load_settings(root, environ)
     plan = build_bootstrap_plan(
@@ -423,6 +478,12 @@ def run_bootstrap(
         result = runner(item["command"], check=False)
         if result.returncode:
             return int(result.returncode)
+        if item.get("kind") == "installer" and item.get("tool") == "nvm":
+            installed = inspect_tool("nvm")["installed"]
+            if not isinstance(installed, str) or (
+                item.get("version") and installed != item["version"]
+            ):
+                return 2
     if any(item.get("kind") == "manual" and "scope" not in item for item in plan):
         return 2
     if uv_will_be_installed:

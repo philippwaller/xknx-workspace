@@ -1,4 +1,5 @@
 import json
+import subprocess
 from io import BytesIO
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -6,6 +7,19 @@ from subprocess import CompletedProcess
 import pytest
 
 import xknx_workspace as ws
+
+
+class FakeResponse(BytesIO):
+    def __init__(
+        self,
+        payload: bytes,
+        url: str = "https://api.github.com/repos/nvm-sh/nvm/releases/latest",
+    ) -> None:
+        super().__init__(payload)
+        self.url = url
+
+    def geturl(self) -> str:
+        return self.url
 
 
 def test_default_profile_contains_the_complete_ha_knx_stack() -> None:
@@ -101,9 +115,50 @@ def test_nvm_installer_is_versioned_official_source() -> None:
         "command": [
             "sh",
             "-c",
-            "curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | PROFILE=/dev/null bash",
+            'tmp=$(mktemp) && trap \'rm -f "$tmp"\' EXIT && '
+            "curl -fsS --location --max-redirs 0 --proto '=https' "
+            '-o "$tmp" https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh && '
+            'PROFILE=/dev/null bash "$tmp"',
         ],
     }
+
+
+def test_nvm_installer_propagates_a_curl_failure(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    curl = bin_dir / "curl"
+    curl.write_text("#!/bin/sh\nexit 7\n")
+    curl.chmod(0o755)
+
+    result = subprocess.run(
+        ws.nvm_install_action("v0.40.3")["command"],
+        env={"HOME": str(tmp_path), "PATH": f"{bin_dir}:/usr/bin:/bin"},
+        check=False,
+    )
+
+    assert result.returncode != 0
+
+
+def test_bootstrap_verifies_nvm_after_the_installer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = [{"kind": "installer", "tool": "nvm", "command": ["install-nvm"]}]
+    monkeypatch.setattr(ws, "build_bootstrap_plan", lambda *args, **kwargs: plan)
+    monkeypatch.setattr(ws, "load_settings", lambda *args: {})
+    monkeypatch.setattr(
+        ws,
+        "inspect_tool",
+        lambda name: {"kind": "tool", "tool": name, "executable": None, "installed": None},
+    )
+
+    assert ws.run_bootstrap(
+        tmp_path,
+        "default",
+        yes=True,
+        argv=["bootstrap", "default", "--yes"],
+        environ={},
+        runner=lambda command, **kwargs: CompletedProcess(command, 0),
+    ) == 2
 
 
 def test_missing_docker_is_warning_not_failure() -> None:
@@ -120,13 +175,22 @@ def test_unreachable_docker_daemon_has_a_platform_start_action() -> None:
 
 
 def test_nvm_release_is_resolved_from_an_exact_official_tag() -> None:
-    opener = lambda *_args, **_kwargs: BytesIO(b'{"tag_name": "v0.40.3"}')
+    opener = lambda *_args, **_kwargs: FakeResponse(b'{"tag_name": "v0.40.3"}')
     assert ws.resolve_nvm_release(opener=opener) == "v0.40.3"
 
 
 def test_nvm_release_rejects_a_floating_ref() -> None:
-    opener = lambda *_args, **_kwargs: BytesIO(b'{"tag_name": "master"}')
+    opener = lambda *_args, **_kwargs: FakeResponse(b'{"tag_name": "master"}')
     with pytest.raises(ValueError, match="invalid NVM release"):
+        ws.resolve_nvm_release(opener=opener)
+
+
+def test_nvm_release_rejects_an_api_redirect() -> None:
+    opener = lambda *_args, **_kwargs: FakeResponse(
+        b'{"tag_name": "v0.40.3"}',
+        "https://api.github.com/repositories/612230/releases/latest",
+    )
+    with pytest.raises(ValueError, match="redirected NVM release API"):
         ws.resolve_nvm_release(opener=opener)
 
 
@@ -183,6 +247,7 @@ def test_bootstrap_plan_contains_context_tools_nvm_and_docker(
         "profile": "default",
         "repositories": ws.repositories_for("default"),
         "settings": {"profile": "default"},
+        "enforce_tool_versions": False,
     }
     assert any(item.get("command") == ["brew", "install", "uv"] for item in plan)
     assert any(item.get("tool") == "nvm" and item.get("version") == "0.40.3" for item in plan)
@@ -210,6 +275,36 @@ def test_docs_prerequisites_are_scoped_and_never_use_mise(
     assert {action["tool"] for action in actions if action["kind"] == "manual"} == {"ruby", "bundler"}
     assert all(action.get("scope") == "docs" for action in actions)
     assert "mise" not in repr(actions).lower()
+
+
+def test_each_docs_repository_gets_its_own_ruby_version_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requirements = {
+        "xknx/docs/.ruby-version": "3.3.0",
+        "home-assistant.io/.ruby-version": "3.4.0",
+    }
+    for relative, version in requirements.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True)
+        path.write_text(f"{version}\n")
+
+    def inspect(name: str, expectation: str | None = None) -> dict[str, object]:
+        return {
+            "kind": "tool",
+            "tool": name,
+            "executable": f"/bin/{name}",
+            "installed": "3.3.0" if name == "ruby" else "2.6.9",
+        }
+
+    monkeypatch.setattr(ws, "inspect_tool", inspect)
+    actions = ws.docs_prerequisite_actions(tmp_path, "docs")
+    ruby = {action["repository"]: action for action in actions if action["tool"] == "ruby"}
+
+    assert ruby["xknx/docs"]["relation"] == "current"
+    assert ruby["home-assistant.io"]["expected"] == "3.4.0"
+    assert ruby["home-assistant.io"]["kind"] == "manual"
+    assert ruby["home-assistant.io"]["blocking"] is True
 
 
 def test_confirmed_plan_digest_rejects_changed_plan() -> None:
@@ -325,6 +420,81 @@ def test_reexec_rejects_a_tampered_confirmed_plan(
             environ={
                 ws.CONFIRMED_PLAN_ENV: '[{"kind":"installer"}]',
                 ws.CONFIRMED_PLAN_DIGEST_ENV: "0" * 64,
+            },
+        )
+
+
+def test_reexec_accepts_completed_prerequisites_but_rejects_changed_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = {
+        "kind": "context",
+        "platform": "macos",
+        "profile": "default",
+        "repositories": ws.repositories_for("default"),
+        "settings": {"profile": "default"},
+        "enforce_tool_versions": False,
+    }
+    confirmed = [
+        context,
+        {"kind": "tool", "tool": "uv", "executable": None, "installed": None},
+        {"kind": "package", "command": ["brew", "install", "uv"]},
+    ]
+    current = [
+        context,
+        {"kind": "tool", "tool": "uv", "executable": "/opt/homebrew/bin/uv", "installed": "0.8.17"},
+    ]
+    monkeypatch.setattr(ws, "load_settings", lambda *args: {"profile": "default"})
+    monkeypatch.setattr(ws, "build_bootstrap_plan", lambda *args, **kwargs: current)
+    environ = {
+        ws.CONFIRMED_PLAN_ENV: ws._serialized_plan(confirmed),
+        ws.CONFIRMED_PLAN_DIGEST_ENV: ws.plan_digest(confirmed),
+    }
+
+    assert ws.run_bootstrap(
+        tmp_path,
+        "default",
+        yes=True,
+        argv=["bootstrap", "default", "--yes"],
+        environ=environ,
+    ) == 0
+
+    current[0] = {**context, "profile": "docs", "repositories": ws.repositories_for("docs")}
+    with pytest.raises(ValueError, match="confirmed bootstrap intent changed"):
+        ws.run_bootstrap(
+            tmp_path,
+            "docs",
+            yes=True,
+            argv=["bootstrap", "docs", "--yes"],
+            environ=environ,
+        )
+
+
+def test_reexec_rejects_a_new_unconfirmed_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = {
+        "kind": "context",
+        "platform": "macos",
+        "profile": "default",
+        "repositories": ws.repositories_for("default"),
+        "settings": {},
+        "enforce_tool_versions": False,
+    }
+    confirmed = [context, {"kind": "package", "command": ["brew", "install", "uv"]}]
+    current = [context, {"kind": "installer", "command": ["sh", "-c", "unexpected"]}]
+    monkeypatch.setattr(ws, "load_settings", lambda *args: {})
+    monkeypatch.setattr(ws, "build_bootstrap_plan", lambda *args, **kwargs: current)
+
+    with pytest.raises(ValueError, match="unconfirmed prerequisite action"):
+        ws.run_bootstrap(
+            tmp_path,
+            "default",
+            yes=True,
+            argv=["bootstrap", "default", "--yes"],
+            environ={
+                ws.CONFIRMED_PLAN_ENV: ws._serialized_plan(confirmed),
+                ws.CONFIRMED_PLAN_DIGEST_ENV: ws.plan_digest(confirmed),
             },
         )
 
