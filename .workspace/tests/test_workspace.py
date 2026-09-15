@@ -17,6 +17,51 @@ def workspace_root() -> Path:
     return Path(__file__).parents[2]
 
 
+def test_automation_covers_uv_actions_and_two_smoke_platforms(workspace_root: Path) -> None:
+    dependabot = (workspace_root / ".github/dependabot.yml").read_text()
+    ci = (workspace_root / ".github/workflows/ci.yml").read_text()
+    smoke = (workspace_root / ".github/workflows/upstream-smoke.yml").read_text()
+    assert 'package-ecosystem: "uv"' in dependabot
+    assert 'directory: "/.workspace"' in dependabot
+    assert 'package-ecosystem: "github-actions"' in dependabot
+    assert "pytest .workspace/tests" in ci
+    assert "macos-latest" in smoke and "ubuntu-latest" in smoke
+    assert "./bootstrap default --yes --progress plain" in smoke
+
+
+def test_automation_is_bounded_and_does_not_start_background_services(
+    workspace_root: Path,
+) -> None:
+    dependabot = (workspace_root / ".github/dependabot.yml").read_text()
+    ci = (workspace_root / ".github/workflows/ci.yml").read_text()
+    smoke = (workspace_root / ".github/workflows/upstream-smoke.yml").read_text()
+
+    assert dependabot.count('interval: "weekly"') == 2
+    assert 'directory: "/"' in dependabot
+    assert "renovate" not in dependabot.lower() and "mise" not in dependabot.lower()
+
+    assert "permissions:\n  contents: read" in ci
+    assert "os: [ubuntu-latest, macos-latest]" in ci
+    assert "runs-on: ${{ matrix.os }}" in ci
+    assert "timeout-minutes:" in ci
+    assert "astral-sh/setup-uv@v7" in ci
+    assert "uv sync --project .workspace --locked --group dev" in ci
+    assert "sh -n bootstrap dev" in ci
+    assert "./bootstrap" not in ci and "./dev start" not in ci
+
+    assert "permissions:\n  contents: read" in smoke
+    assert "schedule:" in smoke and "workflow_dispatch:" in smoke
+    assert "runs-on: ${{ matrix.os }}" in smoke
+    assert "timeout-minutes:" in smoke
+    assert "./dev status --format json" in smoke
+    assert "actions/upload-artifact@v7" in smoke
+    assert "if: failure()" in smoke
+    assert "path: .state/logs/*.log" in smoke
+    assert "if-no-files-found: ignore" in smoke
+    assert "include-hidden-files" not in smoke
+    assert "./dev start" not in smoke and "./dev stop" not in smoke
+
+
 class FakeResponse(BytesIO):
     def __init__(
         self,
