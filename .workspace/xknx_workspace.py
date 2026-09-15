@@ -1920,6 +1920,41 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.dev_command == "status":
         render_status(collect_status(ROOT), args.format)
         return 0
+    if args.dev_command == "update":
+        progress = Progress(args.progress, log_dir=ROOT / ".state/logs")
+        attempted = 0
+        code = 0
+        try:
+            repositories = repositories_for(args.profile)
+            for name in repositories:
+                path = ROOT / name
+                if path.exists():
+                    status = ensure_repository(path, REPOSITORIES[name])
+                    failure = 1 if status["error"] else 0
+                else:
+                    status = _empty_repository_status(
+                        path,
+                        f"checkout is missing; run ./bootstrap {args.profile}",
+                        "error",
+                    )
+                    failure = 2
+                detail = repository_row(status)
+                if status["error"]:
+                    detail += f"; {status['error']}"
+                progress.emit(name, "error" if failure else "success", detail)
+                attempted += 1
+                if failure:
+                    code = failure
+                    break
+        except (KeyError, OSError, ValueError) as error:
+            progress.emit("update", "error", f"Error: {error}")
+            code = 2
+        except KeyboardInterrupt:
+            code = 130
+        finally:
+            progress.emit("update", "summary", f"Processed {attempted} repositories; exit code {code}")
+            progress.close()
+        return code
     if args.dev_command == "stop":
         try:
             return stop_tmux()

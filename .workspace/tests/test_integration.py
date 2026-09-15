@@ -117,6 +117,26 @@ def test_safe_update_only_fast_forwards_a_clean_default_branch(tmp_path: Path) -
     assert local_file.read_text() == "mine"
 
 
+def test_main_update_fast_forwards_an_existing_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    origin, upstream, checkout = create_checkout(tmp_path)
+    commit(upstream, "update", "update.txt")
+    git("-C", upstream, "push")
+    old_head = git("-C", checkout, "rev-parse", "HEAD").stdout.strip()
+
+    monkeypatch.setattr(ws, "ROOT", tmp_path)
+    monkeypatch.setattr(ws, "repositories_for", lambda profile: ("xknx",))
+    monkeypatch.setitem(ws.REPOSITORIES, "xknx", str(origin))
+
+    assert ws.main(["dev", "update", "default", "--progress", "json"]) == 0
+    assert git("-C", checkout, "rev-parse", "HEAD").stdout.strip() != old_head
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [event["task"] for event in events] == ["xknx", "update"]
+    assert events[0]["status"] == "success"
+    assert events[-1]["status"] == "summary"
+
+
 def test_ensure_repository_clones_the_remote_default_branch(tmp_path: Path) -> None:
     origin = tmp_path / "origin.git"
     upstream = tmp_path / "upstream"

@@ -553,7 +553,86 @@ def test_main_accepts_the_public_command_surface(argv: list[str], monkeypatch: p
     monkeypatch.setattr(ws, "start_tmux_command_or_message", lambda *args, **kwargs: {"returncode": 0})
     monkeypatch.setattr(ws, "tmux_status", lambda: {"session": "xknx-dev", "running": False, "windows": []})
     monkeypatch.setattr(ws, "stop_tmux", lambda: 0)
+    if argv[:2] == ["dev", "update"]:
+        monkeypatch.setattr(ws, "repositories_for", lambda profile: ())
     assert ws.main(argv) == 0
+
+
+def repository_result(path: Path, *, error: str | None = None) -> dict[str, object]:
+    return {
+        "path": str(path),
+        "branch": "trunk",
+        "default_branch": "trunk",
+        "dirty": False,
+        "ahead": 0,
+        "behind": 0,
+        "diverged": False,
+        "action": "error" if error else "fetched",
+        "error": error,
+    }
+
+
+def test_main_update_processes_exactly_the_selected_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    selected = ws.repositories_for("toolkit")
+    for name in selected:
+        (tmp_path / name).mkdir()
+    attempted: list[str] = []
+
+    def update(path: Path, origin: str) -> dict[str, object]:
+        attempted.append(path.name)
+        return repository_result(path)
+
+    monkeypatch.setattr(ws, "ROOT", tmp_path)
+    monkeypatch.setattr(ws, "ensure_repository", update)
+
+    assert ws.main(["dev", "update", "toolkit", "--progress", "quiet"]) == 0
+    assert attempted == list(selected)
+    assert "summary" in capsys.readouterr().out
+
+
+def test_main_update_stops_and_returns_the_first_real_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    selected = ws.repositories_for("default")
+    for name in selected:
+        (tmp_path / name).mkdir()
+    attempted: list[str] = []
+
+    def update(path: Path, origin: str) -> dict[str, object]:
+        attempted.append(path.name)
+        error = "private-value" if path.name == "xknxproject" else None
+        return repository_result(path, error=error)
+
+    monkeypatch.setattr(ws, "ROOT", tmp_path)
+    monkeypatch.setattr(ws, "ensure_repository", update)
+    monkeypatch.setenv("UPDATE_TOKEN", "private-value")
+
+    assert ws.main(["dev", "update", "default", "--progress", "quiet"]) == 1
+    assert attempted == list(selected[:3])
+    assert "private-value" not in capsys.readouterr().out
+
+
+def test_main_update_reports_a_missing_checkout_without_cloning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    called = False
+
+    def update(path: Path, origin: str) -> dict[str, object]:
+        nonlocal called
+        called = True
+        return repository_result(path)
+
+    monkeypatch.setattr(ws, "ROOT", tmp_path)
+    monkeypatch.setattr(ws, "repositories_for", lambda profile: ("xknx",))
+    monkeypatch.setattr(ws, "ensure_repository", update)
+
+    assert ws.main(["dev", "update", "default", "--progress", "plain"]) == 2
+    output = capsys.readouterr()
+    assert "./bootstrap default" in output.out + output.err
+    assert called is False
+    assert not (tmp_path / "xknx").exists()
 
 
 @pytest.mark.parametrize(
