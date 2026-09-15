@@ -1773,9 +1773,6 @@ def ensure_repository(path: Path, origin: str, runner=subprocess.run) -> dict[st
         top_level = _git(path, runner, "rev-parse", "--show-toplevel")
         if top_level.returncode or Path(top_level.stdout.strip()).resolve() != path.resolve():
             return _empty_repository_status(path, "existing path is not a Git repository")
-        actual_origin = _git(path, runner, "remote", "get-url", "origin")
-        if actual_origin.returncode or actual_origin.stdout.strip() != origin:
-            return _empty_repository_status(path, "existing repository origin differs from catalog")
         status = safe_update(path, runner)
     else:
         path.parent.mkdir(parents=True, exist_ok=True)

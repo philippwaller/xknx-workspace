@@ -614,15 +614,17 @@ def test_ensure_repository_rejects_owned_paths_before_fetch(tmp_path: Path) -> N
     assert marker.read_text() == "mine"
 
 
-def test_ensure_repository_rejects_a_different_origin_before_fetch(tmp_path: Path) -> None:
-    path = tmp_path / "xknx"
-    git("init", path)
-    git("-C", path, "remote", "add", "origin", "https://example.invalid/mine.git")
+def test_ensure_repository_accepts_existing_checkout_with_fork_origin(tmp_path: Path) -> None:
+    origin, _, checkout = create_checkout(tmp_path)
 
-    result = ws.ensure_repository(path, "https://example.invalid/upstream.git", run)
+    result = ws.ensure_repository(
+        checkout, "https://example.invalid/upstream.git", run
+    )
 
-    assert result["action"] == "conflict"
-    assert "origin differs" in str(result["error"])
+    assert result["error"] is None
+    assert git("-C", checkout, "remote", "get-url", "origin").stdout.strip() == str(
+        origin
+    )
 
 
 def test_safe_update_reports_fetch_failure_with_the_stable_status_keys(tmp_path: Path) -> None:
