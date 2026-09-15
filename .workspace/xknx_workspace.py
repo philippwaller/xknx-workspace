@@ -92,8 +92,10 @@ PACKAGE_SOURCE_LINKS = {
 }
 
 NODE_REPOSITORIES = {"home-assistant-frontend", "knx-frontend", "xknxtoolkit", "home-assistant.io"}
-CONFIRMED_PLAN_ENV = "XKNX_WORKSPACE_CONFIRMED_PLAN"
-CONFIRMED_PLAN_DIGEST_ENV = "XKNX_WORKSPACE_CONFIRMED_PLAN_SHA256"
+MINIMUM_TOOL_VERSIONS = {"git": "2.39.0", "uv": "0.8.17", "tmux": "3.2"}
+DIAGNOSTIC_TIMEOUT = 5
+DOCS_URLS = {"xknx-docs": "http://127.0.0.1:4001/", "ha-docs": "http://127.0.0.1:4000/"}
+REAL_KNX_NOTE = "Secure material is a validated local reference only; configure the KNX integration in Home Assistant explicitly. The workspace does not generate or overwrite that integration configuration."
 NVM_RELEASE_API = "https://api.github.com/repos/nvm-sh/nvm/releases/latest"
 TMUX_SESSION = "xknx-dev"
 TMUX_TARGET = f"={TMUX_SESSION}"
@@ -133,6 +135,11 @@ def redact(text: str, secrets: set[str]) -> str:
         for form in (value.replace("'", "'\"'\"'"), value):
             text = text.replace(json.dumps(form)[1:-1], "***")
             text = text.replace(form, "***")
+        if "\n" in value or "\r" in value:
+            # Parts can arrive on different streams. Match complete lines so
+            # short lines such as "on" do not become global substring secrets.
+            for line in filter(None, value.splitlines()):
+                text = re.sub(r"(?m)^" + re.escape(line) + r"(?=\r?$)", "***", text)
     return text
 
 
@@ -243,11 +250,25 @@ async def _stop_process(process, completion, *, group: bool = True) -> None:
                 process.send_signal(sig)
         except ProcessLookupError:
             pass
-        try:
-            await asyncio.wait_for(asyncio.shield(completion), 0.5)
-            return
-        except TimeoutError:
-            continue
+        if group:
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    await completion
+                    return
+                except PermissionError:
+                    # Darwin can report EPERM while killed group members are
+                    # being reaped. Keep the bounded escalation active.
+                    pass
+                await asyncio.sleep(0.05)
+        else:
+            try:
+                await asyncio.wait_for(asyncio.shield(completion), 0.5)
+                return
+            except TimeoutError:
+                continue
     await completion
 
 
@@ -262,19 +283,29 @@ async def run_job(job: Job, progress: Progress, *, command_runner=None, verify=N
     async def read_output(stream, output: list[str]) -> None:
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         pending = ""
-        while chunk := await stream.read(65536):
-            text = decoder.decode(chunk)
+        forms = {form for value in progress.secrets for form in (value, value.replace("'", "'\"'\"'"), json.dumps(value)[1:-1]) if form}
+        while True:
+            chunk = await stream.read(65536)
+            text = decoder.decode(chunk, final=not chunk)
             output.append(text)
-            lines = (pending + text).replace("\r", "\n").split("\n")
-            pending = lines.pop()
+            pending = redact(pending + text, progress.secrets)
+            # Keep a possible secret prefix, including its newlines, until the
+            # next chunk resolves it. Ordinary short words are never secrets.
+            boundary = len(pending)
+            for form in forms:
+                for size in range(1, min(len(form), len(pending)) + 1):
+                    if pending.endswith(form[:size]):
+                        boundary = min(boundary, len(pending) - size)
+            if chunk:
+                boundary = max(pending.rfind("\n", 0, boundary), pending.rfind("\r", 0, boundary)) + 1
+            else:
+                boundary = len(pending)
+            lines, pending = pending[:boundary].replace("\r", "\n").split("\n"), pending[boundary:]
             for line in lines:
                 if line.strip():
-                    detail = redact(line, progress.secrets)
-                    progress.emit(job.name, "running", detail if progress.verbose else detail[-500:])
-        tail = decoder.decode(b"", final=True)
-        output.append(tail)
-        if pending + tail:
-            progress.emit(job.name, "running", pending + tail)
+                    progress.emit(job.name, "running", line if progress.verbose else line[-500:])
+            if not chunk:
+                break
 
     try:
         for command in job.commands:
@@ -395,8 +426,13 @@ async def run_tool_actions(actions, progress: Progress, *, root: Path = ROOT, co
     failed = False
     for index, item in enumerate(actions):
         name = f"tool-{item.get('tool', index)}"
+        if item.get("kind") == "tool" and item.get("blocking"):
+            progress.emit(name, "error", f"Requires {item['tool']} >= {item['minimum']}; installed {item.get('installed') or 'unavailable'}. Update it explicitly: {TOOL_LINKS[item['tool']]}")
+            results.append(Result(name, 2, 0))
+            failed = True
+            continue
         manual = item.get("kind") == "manual" and "scope" not in item
-        if not manual and (item.get("kind") not in {"package", "installer"} or not item.get("command")):
+        if not manual and (item.get("kind") not in {"package", "installer", "controller"} or not item.get("command")):
             continue
         if failed:
             results.append(Result(name, 1, 0, "skipped"))
@@ -409,6 +445,12 @@ async def run_tool_actions(actions, progress: Progress, *, root: Path = ROOT, co
             continue
 
         def verify():
+            if item.get("kind") == "package" and (package := _package_parts(item["command"])):
+                for name in sorted(package[1] & MINIMUM_TOOL_VERSIONS.keys()):
+                    state = inspect_tool(name)
+                    progress.versions = {**progress.versions, name: state["installed"]}
+                    if state["installed"] is None or _version_tuple(state["installed"]) < _version_tuple(MINIMUM_TOOL_VERSIONS[name]):
+                        return f"Requires {name} >= {MINIMUM_TOOL_VERSIONS[name]}; package-source install did not provide a compatible version"
             if item.get("kind") == "installer" and item.get("tool") == "nvm":
                 installed = inspect_tool("nvm")["installed"]
                 progress.versions = {**progress.versions, "nvm": installed}
@@ -419,6 +461,7 @@ async def run_tool_actions(actions, progress: Progress, *, root: Path = ROOT, co
         result = await run_job(
             Job(name, root, (item["command"],)), progress,
             command_runner=command_runner, verify=verify,
+            env={name: value for name, value in os.environ.items() if name not in {"UV_PROJECT_ENVIRONMENT", "VIRTUAL_ENV"}},
         )
         results.append(result)
         failed = result.returncode != 0
@@ -438,12 +481,6 @@ async def bootstrap_workspace(plan: dict[str, object], progress: Progress) -> in
         )
         if not all(result.returncode == 0 for result in results):
             code = next(result.returncode for result in results if result.returncode != 0)
-            return code
-        if reexec := plan.get("reexec"):
-            reexec()
-            pending = []
-            pending_callbacks.clear()
-            code = 0
             return code
         if configuration:
             create_local_configuration(configuration, plan["root"])
@@ -563,9 +600,9 @@ def missing_tool_actions(
             for name in missing:
                 try:
                     result = subprocess.run(
-                        ["apt-cache", "show", name], capture_output=True, text=True, check=False
+                        ["apt-cache", "show", name], capture_output=True, text=True, check=False, timeout=DIAGNOSTIC_TIMEOUT,
                     )
-                except OSError:
+                except (OSError, subprocess.TimeoutExpired):
                     break
                 if result.returncode == 0:
                     apt_packages.add(name)
@@ -619,7 +656,7 @@ def nvm_shell(command: list[str]) -> list[str]:
         "-lc",
         'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"; '
         '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; '
-        f"nvm install --silent && nvm use --silent && {quoted}",
+        'nvm install --silent && nvm use --silent && "$NVM_BIN/corepack" enable yarn && ' + quoted,
     ]
 
 
@@ -665,13 +702,13 @@ def project_development_jobs(root: Path, profile: str) -> list[Job]:
     adapters = {
         "knx-frontend": ("knx-frontend", nvm_shell(["script/develop"])),
         "home-assistant-frontend": ("home-assistant-frontend", nvm_shell(["script/develop"])),
-        "xknxtoolkit": ("toolkit", ["uv", "run", "python", "-m", "knx_gui.main"]),
+        "xknxtoolkit": ("toolkit", [str(root.resolve() / "xknxtoolkit/.venv/bin/python"), "-m", "knx_gui.main"]),
         "home-assistant.io": ("ha-docs", ["bundle", "exec", "rake", "preview"]),
     }
     jobs = []
     for name in repositories_for(profile):
         if name == "home-assistant.io":
-            jobs.append(Job("xknx-docs", root.resolve() / "xknx/docs", (["bundle", "exec", "jekyll", "serve"],)))
+            jobs.append(Job("xknx-docs", root.resolve() / "xknx/docs", (["bundle", "exec", "jekyll", "serve", "--port", "4001"],)))
         if name in adapters:
             jobs.append(Job(adapters[name][0], root.resolve() / name, (adapters[name][1],)))
     return jobs
@@ -704,12 +741,13 @@ def tmux_windows(profile: str) -> tuple[str, ...]:
 
 
 def _tmux_session_exists(runner=subprocess.run) -> bool:
-    return runner(
-        ["tmux", "has-session", "-t", TMUX_TARGET],
-        capture_output=True,
-        text=True,
-        check=False,
-    ).returncode == 0
+    try:
+        return runner(
+            ["tmux", "has-session", "-t", TMUX_TARGET],
+            capture_output=True, text=True, check=False, timeout=DIAGNOSTIC_TIMEOUT,
+        ).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
 
 
 def _ha_command_fingerprint(command: Sequence[str]) -> str:
@@ -797,6 +835,7 @@ def tmux_status(runner=subprocess.run) -> dict[str, object]:
         capture_output=True,
         text=True,
         check=False,
+        timeout=DIAGNOSTIC_TIMEOUT,
     )
     if result.returncode:
         return {"session": TMUX_SESSION, "running": False, "windows": [], "error": result.stderr.strip()}
@@ -1116,8 +1155,7 @@ async def smoke_default(plan: dict[str, object], progress: Progress, *, timeout:
     finally:
         if process is not None:
             progress.emit("smoke-home-assistant", "running", "Stopping and reaping temporary foreground Home Assistant child")
-            if not completion.done():
-                await _stop_process(process, completion)
+            await _stop_process(process, completion)
             stdout, stderr = await completion
         log = write_task_log(
             progress.log_dir, "smoke-home-assistant", command=[command] if process is not None else [],
@@ -1162,7 +1200,7 @@ def package_source_available(platform: str) -> bool:
     return all(shutil.which(command) for command in commands)
 
 
-def inspect_tool(name: str, expectation: str | None = None) -> dict[str, object]:
+def inspect_tool(name: str, expectation: str | None = None, *, cwd: Path | None = None) -> dict[str, object]:
     executable = shutil.which(name)
     command = [executable, "--version"] if executable else None
     if name == "tmux" and executable:
@@ -1178,29 +1216,34 @@ def inspect_tool(name: str, expectation: str | None = None) -> dict[str, object]
             ]
     installed = None
     if command:
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
-        if result.returncode == 0 and (match := re.search(r"\d+(?:\.\d+)+", result.stdout or result.stderr)):
-            installed = match.group()
+        try:
+            result = subprocess.run(command, cwd=cwd, capture_output=True, text=True, check=False, timeout=DIAGNOSTIC_TIMEOUT)
+            if result.returncode == 0 and (match := re.search(r"\d+(?:\.\d+)+", result.stdout or result.stderr)):
+                installed = match.group()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     status: dict[str, object] = {
         "kind": "tool",
         "tool": name,
         "executable": executable,
         "installed": installed,
     }
-    if expectation:
-        status.update(version_decision(name, installed, expectation, enforce=False))
+    minimum = MINIMUM_TOOL_VERSIONS.get(name)
+    if expectation or minimum:
+        status.update(version_decision(name, installed, expectation or minimum, enforce=False))
+    if minimum:
+        status.update(minimum=minimum, blocking=executable is not None and (installed is None or _version_tuple(installed) < _version_tuple(minimum)))
     return status
 
 
 def inspect_docker(platform: str) -> dict[str, object]:
     executable = shutil.which("docker")
-    reachable = bool(
-        executable
-        and subprocess.run(
-            [executable, "info"], capture_output=True, text=True, check=False
-        ).returncode
-        == 0
-    )
+    try:
+        reachable = bool(executable and subprocess.run(
+            [executable, "info"], capture_output=True, text=True, check=False, timeout=DIAGNOSTIC_TIMEOUT,
+        ).returncode == 0)
+    except (OSError, subprocess.TimeoutExpired):
+        return {**docker_status(platform, executable, False), "level": "info", "error": "Docker daemon check unavailable or timed out"}
     return docker_status(platform, executable, reachable)
 
 
@@ -1238,15 +1281,21 @@ def collect_status(root: Path, settings: Mapping[str, object] | None = None, *, 
 
     tools = {}
     names = ["git", "uv", "tmux", "nvm", "node"]
-    if profile in {"docs", "all"}:
-        names.extend(["ruby", "bundle"])
     for name in names:
         try:
             state = inspect_tool(name)
         except (OSError, subprocess.TimeoutExpired):
             state = {"tool": name, "installed": None, "executable": None, "error": "Version check unavailable; run bootstrap"}
-        tools[name] = {**state, "expected": None, "relation": "unconstrained" if state["installed"] else "missing"}
-    for name, version_file in (("node", ".nvmrc"), ("ruby", ".ruby-version")):
+        tools[name] = {"expected": None, "relation": "unconstrained" if state["installed"] else "missing", **state}
+    if profile in {"docs", "all"}:
+        for name in ("ruby", "bundle"):
+            requirements = {repository: inspect_tool(name, cwd=root / repository) for repository in ("xknx/docs", "home-assistant.io")}
+            for repository, state in requirements.items():
+                version_file = root / repository / ".ruby-version"
+                expected = version_file.read_text().strip() if name == "ruby" and version_file.is_file() else None
+                state.update(version_decision(name, state["installed"], expected, False) if expected else {"expected": None, "relation": "available" if state["installed"] else "missing"})
+            tools[name] = {"installed": None, "executable": None, "expected": None, "relation": "per repository", "requirements": requirements}
+    for name, version_file in (("node", ".nvmrc"),):
         if name not in tools:
             continue
         requirements = {}
@@ -1292,7 +1341,11 @@ def collect_status(root: Path, settings: Mapping[str, object] | None = None, *, 
     packages["knx_frontend"]["frontend"] = frontend_status(root, processes)
     status = {
         "workspace": str(root), "profile": profile, "platform": platform,
-        "configuration": {"effective": effective, "conflicts": conflicts, "config_dir": str(config_dir), "home_assistant": home_assistant_http(effective)},
+        "configuration": {
+            "effective": effective, "conflicts": conflicts, "config_dir": str(config_dir), "home_assistant": home_assistant_http(effective),
+            "urls": {"home-assistant": f"http://127.0.0.1:{effective['home_assistant']['port']}/", **(DOCS_URLS if profile in {"docs", "all"} else {})},
+            "knx": {"integration_managed": False, "detail": REAL_KNX_NOTE if effective["knx"]["mode"] == "real" else "Hardware-free; no KNX connection is created"},
+        },
         "tools": tools, "docker": docker, "repositories": repositories, "packages": packages,
         "processes": processes, "smoke": smoke if smoke is not None else {"status": "not-run"},
     }
@@ -1310,10 +1363,13 @@ def render_status(status: Mapping[str, object], format: str = "human", print_fn=
         ("Configuration", json.dumps(status["configuration"]["effective"])),
         ("Conflicts", "; ".join(status["configuration"]["conflicts"]) or "none"),
         ("Home Assistant", status["configuration"]["home_assistant"]["detail"]),
+        ("KNX integration", status["configuration"]["knx"]["detail"]),
     ]
+    rows.extend((name, url) for name, url in status["configuration"]["urls"].items() if name != "home-assistant")
     for name, item in status["tools"].items():
-        requirements = "; ".join(f"{repo}: expects {value['expected']} ({value['relation']})" for repo, value in item.get("requirements", {}).items())
-        rows.append((name, f"{item['installed'] or 'unavailable'} ({item['relation']})" + (f"; {requirements}" if requirements else "")))
+        requirements = "; ".join(f"{repo}: {value.get('installed') or 'unavailable'}, expects {value['expected'] or 'available'} ({value['relation']})" for repo, value in item.get("requirements", {}).items())
+        summary = item["installed"] or ("directory-specific" if item["relation"] == "per repository" else "unavailable")
+        rows.append((name, f"{summary} ({item['relation']})" + (f"; requires >= {item['minimum']}" if item.get("minimum") else "") + (f"; {requirements}" if requirements else "")))
     docker = status["docker"]
     rows.append(("Docker (optional)", "daemon reachable" if docker["available"] else f"daemon unavailable; {docker.get('error') or docker.get('link', '')}"))
     for name, item in status["repositories"].items():
@@ -1336,7 +1392,6 @@ def docs_prerequisite_actions(root: Path, profile: str) -> list[dict[str, object
         ("home-assistant.io", root / "home-assistant.io/.ruby-version"),
     )
     actions: list[dict[str, object]] = []
-    ruby = inspect_tool("ruby") if any(path.is_file() for _, path in requirements) else None
     for repository, path in requirements:
         if not path.is_file():
             actions.append(
@@ -1351,6 +1406,7 @@ def docs_prerequisite_actions(root: Path, profile: str) -> list[dict[str, object
             )
             continue
         expected = path.read_text().strip().lstrip("v")
+        ruby = inspect_tool("ruby", cwd=root / repository)
         decision = version_decision(
             "ruby", ruby["installed"] if ruby and isinstance(ruby["installed"], str) else None, expected, False
         )
@@ -1369,20 +1425,14 @@ def docs_prerequisite_actions(root: Path, profile: str) -> list[dict[str, object
                     "link": "https://www.ruby-lang.org/en/documentation/installation/",
                 }
             )
-    bundler = inspect_tool("bundle")
-    if bundler["executable"] is None:
-        actions.append(
-            {
-                "kind": "manual",
-                "tool": "bundler",
-                "command": [],
-                "scope": "docs",
-                "blocking": True,
-                "link": "https://bundler.io/guides/getting_started.html",
-            }
-        )
-    else:
-        actions.append({**bundler, "scope": "docs"})
+        bundler = inspect_tool("bundle", cwd=root / repository)
+        if bundler["installed"] is None:
+            actions.append({
+                "kind": "manual", "tool": "bundler", "command": [], "scope": "docs",
+                "repository": repository, "blocking": True, "link": "https://bundler.io/guides/getting_started.html",
+            })
+        else:
+            actions.append({**bundler, "scope": "docs", "repository": repository})
     return actions
 
 
@@ -1429,6 +1479,11 @@ def build_bootstrap_plan(
                 plan.append({"kind": "installer", **nvm_install_action(tag), "decision": decision})
     plan.append(inspect_docker(platform))
     plan.extend(docs_prerequisite_actions(root, profile))
+    if not (root / ".workspace/.venv/bin/python").is_file():
+        plan.append({
+            "kind": "controller", "tool": "workspace-cli",
+            "command": ["uv", "sync", "--project", str(root / ".workspace"), "--locked", "--no-dev", "--no-python-downloads", "--python", sys.executable],
+        })
     configuration = configuration_action(root, settings)
     plan.append(configuration)
     plan.extend(
@@ -1443,19 +1498,6 @@ def build_bootstrap_plan(
     return plan
 
 
-def _serialized_plan(plan: Sequence[Mapping[str, object]]) -> str:
-    return json.dumps(plan, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def plan_digest(plan: Sequence[Mapping[str, object]]) -> str:
-    return hashlib.sha256(_serialized_plan(plan).encode()).hexdigest()
-
-
-def validate_plan_digest(plan: Sequence[Mapping[str, object]], digest: str) -> None:
-    if plan_digest(plan) != digest:
-        raise ValueError("confirmed plan changed before execution")
-
-
 def _package_parts(command: object) -> tuple[tuple[str, ...], set[str]] | None:
     if not isinstance(command, list):
         return None
@@ -1463,33 +1505,6 @@ def _package_parts(command: object) -> tuple[tuple[str, ...], set[str]] | None:
         if tuple(command[: len(prefix)]) == prefix:
             return prefix, set(command[len(prefix) :])
     return None
-
-
-def validate_reexec_plan(
-    confirmed: Sequence[Mapping[str, object]], current: Sequence[Mapping[str, object]]
-) -> None:
-    confirmed_context = next((item for item in confirmed if item.get("kind") == "context"), None)
-    current_context = next((item for item in current if item.get("kind") == "context"), None)
-    if _serialized_plan([confirmed_context]) != _serialized_plan([current_context]):
-        raise ValueError("confirmed bootstrap intent changed before re-exec")
-    project_kinds = {"configuration", "setup", "wiring", "smoke"}
-    if _serialized_plan([item for item in confirmed if item.get("kind") in project_kinds]) != _serialized_plan([item for item in current if item.get("kind") in project_kinds]):
-        raise ValueError("re-exec introduced an unconfirmed project action")
-    confirmed_actions = [item for item in confirmed if item.get("kind") in {"package", "installer"}]
-    for action in (item for item in current if item.get("kind") in {"package", "installer"}):
-        if action in confirmed_actions:
-            continue
-        current_package = _package_parts(action.get("command")) if action.get("kind") == "package" else None
-        if current_package and any(
-            confirmed_package
-            and current_package[0] == confirmed_package[0]
-            and current_package[1] <= confirmed_package[1]
-            for candidate in confirmed_actions
-            if candidate.get("kind") == "package"
-            for confirmed_package in [_package_parts(candidate.get("command"))]
-        ):
-            continue
-        raise ValueError("re-exec introduced an unconfirmed prerequisite action")
 
 
 def render_plan(plan: Sequence[Mapping[str, object]], print_fn=print, *, secrets: set[str] | None = None) -> None:
@@ -1503,7 +1518,7 @@ def render_plan(plan: Sequence[Mapping[str, object]], print_fn=print, *, secrets
             print_fn(f"Platform: {item['platform']}  Profile: {item['profile']}")
             print_fn(f"Repositories: {', '.join(item['repositories'])}")
         elif item.get("kind") == "tool":
-            print_fn(f"Tool {item['tool']}: {item.get('installed') or 'unavailable'}")
+            print_fn(f"Tool {item['tool']}: {item.get('installed') or 'unavailable'}" + (f"; requires >= {item['minimum']} ({item['relation']})" if item.get("minimum") else ""))
         elif item.get("kind") == "setup":
             for command in item["commands"]:
                 print_fn(f"Setup {item['name']} ({item['cwd']}): $ {display_command(command, secrets)}")
@@ -1512,6 +1527,8 @@ def render_plan(plan: Sequence[Mapping[str, object]], print_fn=print, *, secrets
             verb = "Reuse existing" if item["reuse_config"] else "Create"
             print_fn(f"{verb} Home Assistant config: {item['config_dir']} (expected port {item['port']})")
             print_fn(f"KNX mode: {item['knx_mode']}" + (" (hardware-free; no KNX connection is created)" if item["knx_mode"] == "automatic" else f"; secure material reference: {item['secure_config_path']}"))
+            if item["knx_mode"] == "real":
+                print_fn(REAL_KNX_NOTE)
             if item["reuse_config"]:
                 print_fn("WARNING: Existing Home Assistant configuration is reused; verify its HTTP port and configured integrations before starting.")
         elif item.get("level") in {"warning", "info"}:
@@ -1534,52 +1551,11 @@ def run_bootstrap(
     environ: Mapping[str, str] = os.environ,
     input_fn=input,
     runner=None,
-    reexec=os.execvpe,
 ) -> int:
     if jobs < 1:
         raise ValueError("jobs must be positive")
-    marker = environ.get(CONFIRMED_PLAN_DIGEST_ENV)
-    carried = environ.get(CONFIRMED_PLAN_ENV)
-    if marker or carried:
-        if not marker or not carried:
-            raise ValueError("incomplete confirmed plan marker")
-        confirmed_plan = json.loads(carried)
-        validate_plan_digest(confirmed_plan, marker)
-        settings = load_settings(root, environ)
-        plan = build_bootstrap_plan(
-            root, profile, settings, enforce_tool_versions=enforce_tool_versions
-        )
-        validate_reexec_plan(confirmed_plan, plan)
-    else:
-        settings = load_settings(root, environ)
-        plan = build_bootstrap_plan(
-            root, profile, settings, enforce_tool_versions=enforce_tool_versions
-        )
-    uv_missing = any(
-        item.get("kind") == "tool" and item.get("tool") == "uv" and item.get("executable") is None
-        for item in plan
-    )
-    uv_will_be_installed = uv_missing and any(
-        item.get("kind") == "package" and "uv" in item.get("command", ())
-        for item in plan
-    )
-
-    def reexec_with_plan() -> None:
-        child_environ = dict(environ)
-        child_environ[CONFIRMED_PLAN_ENV] = _serialized_plan(plan)
-        child_environ[CONFIRMED_PLAN_DIGEST_ENV] = plan_digest(plan)
-        command = [
-            shutil.which("uv") or "uv",
-            "run",
-            "--project",
-            str(root / ".workspace"),
-            "--locked",
-            "python",
-            str(Path(__file__).resolve()),
-            *argv,
-        ]
-        progress.close()
-        reexec(command[0], command, child_environ)
+    settings = load_settings(root, environ)
+    plan = build_bootstrap_plan(root, profile, settings, enforce_tool_versions=enforce_tool_versions)
 
     progress = Progress(
         progress_mode, log_dir=root / ".state/logs", secrets=secret_values(environ), verbose=verbose,
@@ -1596,26 +1572,24 @@ def run_bootstrap(
         "configuration": configuration,
         "wire_home_assistant": wire_home_assistant if any(item.get("kind") == "wiring" for item in plan) else None,
         "smoke_default": smoke_default if any(item.get("kind") == "smoke" for item in plan) else None,
-        "expected_artifacts": {"KNX Frontend": [root / path for path in KNX_FRONTEND_ARTIFACTS]},
-        "reexec": reexec_with_plan if uv_will_be_installed else None,
+        "expected_artifacts": {},
     }
     try:
-        if not marker:
-            lines = []
-            render_plan(plan, lines.append, secrets=progress.secrets)
-            for index, line in enumerate(lines):
-                progress.emit(f"plan-{index + 1}", "planned", line)
-            if yes and configuration and configuration["reuse_config"] and not configuration["explicit_config"]:
-                raise ValueError("home_assistant.config_dir already exists; confirm reuse interactively or explicitly select its absolute path with XKNX_HA_CONFIG_DIR")
-            if not yes:
-                progress.close()
-                prompt = "Execute this plan? [y/N] "
-                if progress_mode == "json":
-                    print(prompt, file=sys.stderr)
-                    prompt = ""
-                if input_fn(prompt).strip().lower() not in {"y", "yes"}:
-                    progress.emit("bootstrap", "summary", "Plan declined")
-                    return 1
+        lines = []
+        render_plan(plan, lines.append, secrets=progress.secrets)
+        for index, line in enumerate(lines):
+            progress.emit(f"plan-{index + 1}", "planned", line)
+        if yes and configuration and configuration["reuse_config"] and not configuration["explicit_config"]:
+            raise ValueError("home_assistant.config_dir already exists; confirm reuse interactively or explicitly select its absolute path with XKNX_HA_CONFIG_DIR")
+        if not yes:
+            progress.close()
+            prompt = "Execute this plan? [y/N] "
+            if progress_mode == "json":
+                print(prompt, file=sys.stderr)
+                prompt = ""
+            if input_fn(prompt).strip().lower() not in {"y", "yes"}:
+                progress.emit("bootstrap", "summary", "Plan declined")
+                return 1
         return asyncio.run(bootstrap_workspace(execution, progress))
     except KeyboardInterrupt:
         progress.emit("bootstrap", "summary", "Interrupted; exit code 130")
@@ -1810,6 +1784,9 @@ def update_repository(
     profile: str,
     progress: Progress,
     runner=None,
+    *,
+    allow_clone: bool = False,
+    echo: bool = False,
 ) -> tuple[dict[str, object], int]:
     runner = runner or subprocess.run
     start, clock_start = datetime.now(timezone.utc), time.monotonic()
@@ -1822,6 +1799,8 @@ def update_repository(
     def recording_runner(command, **kwargs):
         nonlocal first_failure
         commands.append(list(command))
+        if echo:
+            print(f"$ {display_command(command, progress.secrets)}", flush=True)
         try:
             result = runner(command, **kwargs)
         except OSError as error:
@@ -1830,6 +1809,11 @@ def update_repository(
             raise
         stdout.append(result.stdout or "")
         stderr.append(result.stderr or "")
+        if echo:
+            if result.stdout:
+                print(redact(result.stdout, progress.secrets), end="", flush=True)
+            if result.stderr:
+                print(redact(result.stderr, progress.secrets), end="", file=sys.stderr, flush=True)
         git_args = commands[-1][3:]
         accepted = git_args == ["symbolic-ref", "--short", "HEAD"] or (
             result.returncode == 1
@@ -1840,7 +1824,7 @@ def update_repository(
         return result
 
     try:
-        if not path.exists():
+        if not path.exists() and not allow_clone:
             error = f"checkout is missing; run ./bootstrap {profile}"
             stderr.append(error)
             status = _empty_repository_status(path, error, "error")
@@ -1863,22 +1847,14 @@ def update_repository(
                 stderr.append(str(status["error"]))
         return status, code
     finally:
-        end = datetime.now(timezone.utc)
-        write_task_log(
-            progress.log_dir,
-            f"update-{path.name}",
-            command=commands,
-            cwd=path,
-            stdout="".join(stdout),
-            stderr="".join(stderr),
-            returncode=code,
-            start=start,
-            end=end,
-            duration=time.monotonic() - clock_start,
-            secrets=progress.secrets,
-            versions=progress.versions,
-            decisions=progress.decisions,
-        )
+        # Bootstrap's owning run_job already records this child's full output.
+        if not allow_clone:
+            write_task_log(
+                progress.log_dir, f"update-{path.name}", command=commands, cwd=path,
+                stdout="".join(stdout), stderr="".join(stderr), returncode=code,
+                start=start, duration=time.monotonic() - clock_start,
+                secrets=progress.secrets, versions=progress.versions, decisions=progress.decisions,
+            )
 
 
 def validate_settings_schema(settings: Mapping[str, object]) -> None:
@@ -1956,19 +1932,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if len(argv) != 3:
             return 2
 
-        def logged_git(command, **kwargs):
-            values = secret_values()
-            print(f"$ {display_command(command, values)}", flush=True)
-            result = subprocess.run(command, **kwargs)
-            if result.stdout:
-                print(redact(result.stdout, values), end="", flush=True)
-            if result.stderr:
-                print(redact(result.stderr, values), end="", file=sys.stderr, flush=True)
-            return result
-
-        status = ensure_repository(Path(argv[1]), argv[2], logged_git)
+        path = Path(argv[1])
+        status, code = update_repository(
+            path, argv[2], "default", Progress("quiet", log_dir=path.parent / ".state/logs"),
+            allow_clone=True, echo=True,
+        )
         print(json.dumps(redact_structure(status, secret_values())), flush=True)
-        return 1 if status["error"] else 0
+        return code
     try:
         args = build_parser().parse_args(argv)
     except SystemExit as error:

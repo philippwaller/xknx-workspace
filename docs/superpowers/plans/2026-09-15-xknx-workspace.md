@@ -10,6 +10,22 @@
 
 **Spec:** [`docs/superpowers/specs/2026-09-15-xknx-workspace-design.md`](../specs/2026-09-15-xknx-workspace-design.md)
 
+**Final review corrections:** The implementation uses an existing Python 3.12+
+directly for both launchers, ignoring inherited environment selection. It never
+synchronizes a CLI environment before confirmation or downloads Python
+implicitly; fresh runs use plain output when Rich is unavailable. A missing
+root CLI environment is created by an explicit displayed locked sync after
+the normal confirmation; later runs automatically use Rich without re-exec.
+This supersedes the early launcher/re-exec sketches below.
+Global minimums are Git 2.39.0, uv 0.8.17, and tmux 3.2; older installed tools
+are reported and retained, and package installs are verified against minimums.
+The selected Node environment's Corepack enables project-selected Yarn before
+frontend commands. KNX frontend bootstrap/build always reruns, including when
+old artifacts exist. Ruby/Bundler checks run in each owning docs directory;
+XKNX docs uses port 4001 and HA docs 4000. Real KNX `secure_config_path` validates
+only a readable local reference: contributors configure the KNX integration in
+Home Assistant explicitly; the workspace never generates or overwrites it.
+
 ## Global Constraints
 
 - Preserve nested repositories as normal Git checkouts; do not add them as root submodules.

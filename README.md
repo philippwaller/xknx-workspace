@@ -56,8 +56,28 @@ project-owned setup commands, configuration, editable package wiring, and
 smoke checks. It changes nothing until the single confirmation is accepted.
 Use `./bootstrap default --yes` only when non-interactive acceptance of that
 displayed plan is intentional. A failed or interrupted run is resumed by
-running the same bootstrap command again; completed results are reused, so
-there is no separate reset or resume command.
+running the same bootstrap command again. Environments are reused; the KNX
+frontend runs its own idempotent bootstrap and build every time so old build
+files cannot hide source or dependency changes.
+
+The launchers require an existing Python 3.12+ and never synchronize or download
+anything before confirmation, including for `--help` and daily `dev` commands.
+They ignore inherited `UV_PROJECT_ENVIRONMENT` and `VIRTUAL_ENV`. If Python is too
+old, they print the matching Homebrew/APT command or the official Python link.
+Global minimum versions are Git 2.39.0, uv 0.8.17, and tmux 3.2. Older installed
+tools block setup and remain untouched; update them explicitly. These are
+minimums, not exact package-manager pins, even with `--enforce-tool-versions`.
+
+A fresh run uses complete plain progress when Rich is unavailable. If the root
+CLI environment is missing, the plan includes its locked setup after tool
+installation and the normal confirmation, using the current Python without
+downloading another interpreter. Later runs automatically use that environment
+and its interactive renderer; there is no extra setup command or confirmation.
+An existing root CLI environment is left untouched.
+
+Frontend subprocesses select their project's Node through NVM and enable Yarn
+through that Node installation's Corepack. The project declarations select
+Yarn's version; no global Yarn installation or parent-shell change is needed.
 
 Standalone status reports readiness but leaves smoke as `not-run`; the public
 smoke path runs as part of bootstrap. Do not rerun bootstrap solely for an
@@ -99,13 +119,23 @@ windows. Common controls are:
 
 Failed processes leave their window and shell visible for inspection.
 
+The `docs` and `all` profiles serve XKNX docs at
+[localhost:4001](http://127.0.0.1:4001/) and Home Assistant docs at
+[localhost:4000](http://127.0.0.1:4000/). Both addresses appear in status. Ruby
+and Bundler are inspected separately in each docs directory so version-manager
+shims can honor each `.ruby-version`; an incompatible environment blocks only
+its own docs setup.
+
 ## Configuration, wiring, and logs
 
 Local settings live in ignored `.xknx-dev.toml`, initially copied from
 `.xknx-dev.example.toml`. It selects the profile, Home Assistant port and
 configuration directory, and hardware-free `knx.mode = "automatic"`. Real KNX
-configuration references secure material by path; secrets are not copied into
-the root file or logs.
+configuration references secure material through `knx.secure_config_path`;
+bootstrap validates that the local file is readable. It does not generate or
+overwrite Home Assistant's KNX integration configuration. Configure that
+integration explicitly in Home Assistant. Secrets are not copied into the root
+file or logs.
 
 Bootstrap installs `xknx`, `xknxproject`, `knx-telegram-store`, and
 `knx-frontend` editably into `home-assistant-core/.venv`. Home Assistant skips

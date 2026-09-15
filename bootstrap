@@ -1,11 +1,35 @@
 #!/bin/sh
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-if command -v uv >/dev/null 2>&1; then
-  exec uv run --project "$root/.workspace" --locked python "$root/.workspace/xknx_workspace.py" bootstrap "$@"
-fi
-if command -v python3 >/dev/null 2>&1; then
-  exec python3 "$root/.workspace/xknx_workspace.py" bootstrap "$@"
-fi
-printf '%s\n' "Python 3 is required to display the bootstrap plan."
+unset UV_PROJECT_ENVIRONMENT VIRTUAL_ENV
+case ${0##*/} in dev) workspace_command=dev ;; *) workspace_command=bootstrap ;; esac
+for workspace_python in "$root/.workspace/.venv/bin/python" python3; do
+  if command -v "$workspace_python" >/dev/null 2>&1 && "$workspace_python" -B -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2>/dev/null; then
+    exec "$workspace_python" -B "$root/.workspace/xknx_workspace.py" "$workspace_command" "$@"
+  fi
+done
+printf '%s\n' 'Python 3.12+ is required; no environment was changed.' >&2
+case $(uname -s) in
+  Darwin*)
+    if command -v brew >/dev/null 2>&1; then
+      printf '%s\n' 'Install with: brew install python@3.12' 'Then expose it: export PATH="$(brew --prefix python@3.12)/libexec/bin:$PATH"' >&2
+    else
+      printf '%s\n' 'Install Homebrew: https://brew.sh/ or Python: https://www.python.org/downloads/macos/' >&2
+    fi ;;
+  Linux*)
+    # Read only the two distribution values; never execute os-release contents.
+    workspace_distribution= workspace_release=
+    while IFS='=' read -r workspace_key workspace_value; do
+      workspace_value=${workspace_value#\"}; workspace_value=${workspace_value%\"}
+      case $workspace_key in ID) workspace_distribution=$workspace_value ;; VERSION_ID) workspace_release=${workspace_value%%.*} ;; esac
+    done <<EOF
+$(cat /etc/os-release 2>/dev/null || :)
+EOF
+    case $workspace_distribution:$workspace_release in
+      ubuntu:2[4-9]|ubuntu:[3-9][0-9]|debian:1[3-9]|debian:[2-9][0-9])
+        printf '%s\n' 'Install with: sudo apt-get install -y python3' >&2 ;;
+      *) printf '%s\n' 'The default Python package on this release is not known to provide Python 3.12+. Install a supported Python: https://www.python.org/downloads/source/' >&2 ;;
+    esac ;;
+  *) printf '%s\n' 'Install Python: https://www.python.org/downloads/' >&2 ;;
+esac
 exit 2

@@ -35,6 +35,12 @@ them.
 - Root `.xknx-dev.toml` owns local workspace selection. Child setup scripts,
   version files, manifests, and lockfiles remain authoritative for each
   project.
+- Launchers use an existing Python 3.12+ directly. Bootstrap creates a missing
+  CLI environment only as a displayed, confirmed action. Daily commands and
+  help never synchronize it; plain progress remains usable without Rich.
+- Real KNX `secure_config_path` is a local file reference, not an installed
+  Home Assistant integration configuration. The developer configures that
+  integration explicitly; never copy or print the referenced secret material.
 - Keep the root `home-assistant-frontend` checkout independent from
   `knx-frontend/homeassistant-frontend`; the latter changes only through the
   KNX frontend's own upgrade workflow.

@@ -19,6 +19,263 @@ import pytest
 import xknx_workspace as ws
 
 
+@pytest.mark.parametrize("mode", ["plain", "json", "tty"])
+@pytest.mark.parametrize("verbose", [False, True])
+def test_multiline_secret_never_reaches_live_output_across_chunks(tmp_path: Path, monkeypatch, capsys, mode, verbose) -> None:
+    secret = "first-private-line\nsecond-private-line"
+    monkeypatch.setenv("FINAL_TEST_SECRET", secret)
+    progress = ws.Progress(mode, verbose=verbose, log_dir=tmp_path / "logs")
+    rendered = []
+    render = progress._render_tty
+    def record_render():
+        rendered.append(repr(progress.rows))
+        render()
+    monkeypatch.setattr(progress, "_render_tty", record_render)
+    script = (
+        "import os, sys, time\n"
+        "value = os.environ['FINAL_TEST_SECRET']\n"
+        "for stream in (sys.stdout, sys.stderr):\n"
+        "    for part in (value[:10], value[10:19], value[19:] + '\\n'):\n"
+        "        stream.write(part); stream.flush(); time.sleep(0.03)\n"
+        "print('normal build output')\n"
+    )
+    try:
+        assert asyncio.run(ws.run_job(ws.Job("secret", tmp_path, ([sys.executable, "-c", script],)), progress)).returncode == 0
+    finally:
+        progress.close()
+    output = capsys.readouterr()
+    content = output.out + output.err + "".join(rendered) + repr(progress.rows) + "".join(path.read_text() for path in (tmp_path / "logs").glob("*.log"))
+    assert "first-private-line" not in content and "second-private-line" not in content
+    assert "normal build output" in content and "***" in content
+
+
+def test_multiline_secret_split_between_output_streams_keeps_common_words(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("FINAL_TEST_SECRET", "on\nprivate-second-line")
+    script = "import os, sys; first, second = os.environ['FINAL_TEST_SECRET'].splitlines(); print(first, flush=True); print(second, file=sys.stderr, flush=True); print('condition is on')"
+    progress = ws.Progress("plain", log_dir=tmp_path / "logs")
+    assert asyncio.run(ws.run_job(ws.Job("split", tmp_path, ([sys.executable, "-c", script],)), progress)).returncode == 0
+    output = capsys.readouterr().out
+    content = output + "".join(path.read_text() for path in (tmp_path / "logs").glob("*.log"))
+    assert "private-second-line" not in content
+    assert "split: running: on\n" not in content
+    assert "condition is on" in output
+
+
+def test_cancellation_kills_descendants_after_direct_child_closes_pipes(tmp_path: Path) -> None:
+    async def exercise():
+        child = (
+            "import os, signal, time\nfrom pathlib import Path\n"
+            "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "Path('descendant.pid').write_text(str(os.getpid()))\ntime.sleep(30)\n"
+        )
+        parent = (
+            "import subprocess, sys, time\nfrom pathlib import Path\n"
+            f"subprocess.Popen([sys.executable, '-c', {child!r}], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            "while not Path('descendant.pid').exists(): time.sleep(0.01)\n"
+            "Path('parent.ready').touch()\ntime.sleep(30)\n"
+        )
+        task = asyncio.create_task(ws.run_job(ws.Job("tree", tmp_path, ([sys.executable, "-c", parent],)), ws.Progress("quiet", log_dir=tmp_path / "logs")))
+        pid = None
+        try:
+            async with asyncio.timeout(5):
+                while not (tmp_path / "parent.ready").exists():
+                    await asyncio.sleep(0.01)
+            pid = int((tmp_path / "descendant.pid").read_text())
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 5)
+            assert not process_is_alive(pid)
+        finally:
+            if pid and process_is_alive(pid):
+                os.kill(pid, signal.SIGKILL)
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("entry,args", [("bootstrap", ["--help"]), ("dev", ["--help"]), ("dev", ["start"]), ("dev", ["stop"]), ("dev", ["update"])])
+@pytest.mark.parametrize("existing_environment", [False, True])
+def test_launchers_never_sync_or_use_an_inherited_environment(tmp_path: Path, entry, args, existing_environment) -> None:
+    root = Path(ws.__file__).parents[1]
+    for name in ("bootstrap", "dev"):
+        (tmp_path / name).write_bytes((root / name).read_bytes())
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "dirname").symlink_to("/usr/bin/dirname")
+    interpreter = tmp_path / ".workspace/.venv/bin/python" if existing_environment else bin_dir / "python3"
+    interpreter.parent.mkdir(parents=True, exist_ok=True)
+    interpreter.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in *'sys.version_info'*) exit 0;; esac\n"
+        "[ -z \"${UV_PROJECT_ENVIRONMENT:-}\" ] || exit 78\n"
+        "printf 'direct interpreter: %s\\n' \"$*\"\n"
+    )
+    interpreter.chmod(0o755)
+    uv = bin_dir / "uv"
+    uv.write_text("#!/bin/sh\nprintf 'unexpected uv call\\n'\nexit 79\n")
+    uv.chmod(0o755)
+    result = subprocess.run(["/bin/sh", str(tmp_path / entry), *args], env={"PATH": str(bin_dir), "UV_PROJECT_ENVIRONMENT": str(tmp_path / "unrelated")}, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "direct interpreter:" in result.stdout and "unexpected uv" not in result.stdout
+    assert not (tmp_path / "unrelated").exists()
+
+
+@pytest.mark.parametrize("platform,release,guidance", [
+    ("Darwin", "", "brew install python@3.12"),
+    ("Linux", 'ID=ubuntu\nVERSION_ID="24.04"\n', "apt-get install -y python3"),
+    ("Linux", 'ID=debian\nVERSION_ID="13"\n', "apt-get install -y python3"),
+    ("Linux microsoft-standard-WSL2", 'ID=ubuntu\nVERSION_ID="24.04"\n', "apt-get install -y python3"),
+    ("Linux microsoft-standard-WSL2", 'ID=debian\nVERSION_ID="13"\n', "apt-get install -y python3"),
+    ("Linux microsoft-standard-WSL2", 'ID=ubuntu\nVERSION_ID="22.04"\n', "python.org/downloads"),
+    ("Linux microsoft-standard-WSL2", 'ID=debian\nVERSION_ID="12"\n', "python.org/downloads"),
+])
+def test_launcher_rejects_old_python_before_import_with_os_guidance(tmp_path: Path, platform, release, guidance) -> None:
+    root = Path(ws.__file__).parents[1]
+    (tmp_path / "bootstrap").write_bytes((root / "bootstrap").read_bytes())
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "dirname").symlink_to("/usr/bin/dirname")
+    for name, body in {
+        "python3": "case \"$*\" in *'sys.version_info'*) exit 1;; esac\nprintf 'unsafe module import\\n'; exit 90",
+        "uname": f"printf '%s\\n' {shlex.quote(platform)}",
+        "cat": f"printf '%s' {shlex.quote(release)}",
+        "brew": "exit 91", "apt-get": "exit 92",
+    }.items():
+        executable = bin_dir / name
+        executable.write_text(f"#!/bin/sh\n{body}\n")
+        executable.chmod(0o755)
+    result = subprocess.run(["/bin/sh", str(tmp_path / "bootstrap")], env={"PATH": str(bin_dir)}, capture_output=True, text=True)
+    assert result.returncode == 2
+    assert "Python 3.12+" in result.stderr
+    assert guidance in result.stderr
+    assert "unsafe module import" not in result.stdout + result.stderr
+
+
+def test_selected_node_enables_project_yarn_before_frontend_command(tmp_path: Path) -> None:
+    nvm_dir = tmp_path / "nvm"
+    node_bin = tmp_path / "selected-node/bin"
+    node_bin.mkdir(parents=True)
+    nvm_dir.mkdir()
+    (nvm_dir / "nvm.sh").write_text(f"nvm() {{ export NVM_BIN={shlex.quote(str(node_bin))}; export PATH=\"$NVM_BIN:$PATH\"; }}\n")
+    corepack = node_bin / "corepack"
+    corepack.write_text(
+        "#!/bin/sh\n[ \"$*\" = 'enable yarn' ] || exit 71\n"
+        "[ -f package.json ] || exit 72\n"
+        f"ln -s /usr/bin/true {shlex.quote(str(node_bin / 'yarn'))}\n"
+    )
+    corepack.chmod(0o755)
+    (tmp_path / "package.json").write_text('{"packageManager":"yarn@4.9.2"}')
+    result = subprocess.run(ws.nvm_shell(["yarn", "--version"]), cwd=tmp_path, env={**os.environ, "NVM_DIR": str(nvm_dir)}, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert (node_bin / "yarn").is_symlink()
+
+
+def test_docs_prerequisites_observe_directory_specific_ruby_and_bundler(tmp_path: Path, monkeypatch) -> None:
+    for repo, version in (("xknx/docs", "3.3.9"), ("home-assistant.io", "3.4.4")):
+        directory = tmp_path / repo
+        directory.mkdir(parents=True)
+        (directory / ".ruby-version").write_text(version)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    ruby = bin_dir / "ruby"
+    ruby.write_text("#!/bin/sh\nprintf 'ruby '; /bin/cat .ruby-version\n")
+    ruby.chmod(0o755)
+    bundle = bin_dir / "bundle"
+    bundle.write_text("#!/bin/sh\n[ -f .ruby-version ] || exit 4\n[ ! -f missing-bundler ] || exit 5\nprintf 'Bundler version 2.7.1\\n'\n")
+    bundle.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    actions = ws.docs_prerequisite_actions(tmp_path, "docs")
+    assert not any(action.get("blocking") for action in actions)
+    assert {a["repository"]: a["installed"] for a in actions if a.get("tool") == "ruby"} == {"xknx/docs": "3.3.9", "home-assistant.io": "3.4.4"}
+    (tmp_path / "xknx/docs/missing-bundler").touch()
+    blocked = [a for a in ws.docs_prerequisite_actions(tmp_path, "docs") if a.get("blocking")]
+    assert len(blocked) == 1 and blocked[0]["repository"] == "xknx/docs"
+    assert blocked[0]["tool"] == "bundler"
+    status = ws.collect_status(tmp_path, {**ws.load_settings(tmp_path, {}), "profile": "docs"})
+    assert status["tools"]["ruby"]["requirements"]["xknx/docs"]["installed"] == "3.3.9"
+    assert status["tools"]["ruby"]["requirements"]["home-assistant.io"]["installed"] == "3.4.4"
+    assert status["tools"]["bundle"]["requirements"]["xknx/docs"]["installed"] is None
+
+
+def test_hanging_docker_is_bounded_in_the_complete_bootstrap_plan(tmp_path: Path, monkeypatch) -> None:
+    inspect_docker = ws.inspect_docker
+    fake_planning_tools(monkeypatch)
+    monkeypatch.setattr(ws, "inspect_docker", inspect_docker)
+    executable = tmp_path / "docker"
+    executable.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(30)\n")
+    executable.chmod(0o755)
+    monkeypatch.setattr(ws.shutil, "which", lambda name: str(executable) if name == "docker" else None)
+    monkeypatch.setattr(ws, "DIAGNOSTIC_TIMEOUT", 0.1)
+    start = time.monotonic()
+    plan = ws.build_bootstrap_plan(tmp_path, "default", ws.load_settings(tmp_path, {}))
+    assert time.monotonic() - start < 2
+    docker = next(item for item in plan if item.get("tool") == "docker")
+    assert docker["level"] == "info" and docker["available"] is False
+    assert any(item.get("kind") == "setup" for item in plan)
+
+
+def test_missing_controller_environment_is_planned_confirmed_and_created_locally(tmp_path: Path, monkeypatch, capsys) -> None:
+    fake_planning_tools(monkeypatch)
+    executable = tmp_path / "uv"
+    executable.write_text(
+        f"#!{sys.executable}\nimport os, pathlib, sys\n"
+        "assert 'UV_PROJECT_ENVIRONMENT' not in os.environ and 'VIRTUAL_ENV' not in os.environ\n"
+        "assert sys.argv[1] == 'sync' and '--locked' in sys.argv and '--no-python-downloads' in sys.argv\n"
+        "project = pathlib.Path(sys.argv[sys.argv.index('--project') + 1])\n"
+        "interpreter = project / '.venv/bin/python'\ninterpreter.parent.mkdir(parents=True)\ninterpreter.touch()\n"
+    )
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", str(tmp_path / "unrelated"))
+    monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / "unrelated"))
+    build = ws.build_bootstrap_plan
+    actions = build(tmp_path, "default", ws.load_settings(tmp_path, {}))
+    controller = [item for item in actions if item.get("kind") == "controller"]
+    assert len(controller) == 1
+    command = controller[0]["command"]
+    assert command[command.index("--project") + 1] == str(tmp_path / ".workspace")
+    assert command[command.index("--python") + 1] == sys.executable
+    monkeypatch.setattr(ws, "build_bootstrap_plan", lambda *args, **kwargs: controller)
+    prompts = []
+    def confirm(prompt):
+        prompts.append(prompt)
+        output = capsys.readouterr().out
+        assert "uv sync" in output and "--locked" in output and ".workspace" in output
+        assert not (tmp_path / ".workspace").exists()
+        return "y"
+    assert ws.run_bootstrap(tmp_path, "default", yes=False, argv=["bootstrap"], input_fn=confirm, progress_mode="plain") == 0
+    assert len(prompts) == 1 and (tmp_path / ".workspace/.venv/bin/python").is_file()
+    assert not (tmp_path / "unrelated").exists()
+    assert not any(item.get("kind") == "controller" for item in build(tmp_path, "default", ws.load_settings(tmp_path, {})))
+
+
+def test_bootstrap_private_repository_propagates_exact_git_failure(tmp_path: Path, monkeypatch, capsys) -> None:
+    origin, _, checkout = create_checkout(tmp_path)
+    original = subprocess.run
+    def failure(command, **kwargs):
+        if command[3:5] == ["fetch", "origin"]:
+            return subprocess.CompletedProcess(command, 23, "", "fetch failed\n")
+        return original(command, **kwargs)
+    monkeypatch.setattr(ws.subprocess, "run", failure)
+    assert ws.main(["_repository", str(checkout), str(origin)]) == 23
+    assert "fetch failed" in capsys.readouterr().err
+
+
+def test_bootstrap_logs_the_actual_clone_failure_without_starting_another_repo(tmp_path: Path, monkeypatch) -> None:
+    executable = tmp_path / "git"
+    executable.write_text("#!/bin/sh\nprintf 'clone failure\\n' >&2\nexit 37\n")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    progress = ws.Progress("quiet", log_dir=tmp_path / "logs")
+    plan = {"root": tmp_path, "jobs": 1, "repository_jobs": ws.repository_jobs(tmp_path, {"xknx": "absent", "xknxproject": "absent"})}
+    assert asyncio.run(ws.bootstrap_workspace(plan, progress)) == 37
+    logs = list((tmp_path / "logs").glob("*.log"))
+    assert len(logs) == 1 and "returncode: 37" in logs[0].read_text()
+    assert not (tmp_path / "xknxproject").exists()
+
+
 def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, capture_output=True, text=True, check=False)
 
@@ -640,7 +897,7 @@ def test_quoted_secrets_are_redacted_from_job_and_private_repository_output(tmp_
 def fake_planning_tools(monkeypatch) -> None:
     monkeypatch.setattr(ws, "detect_platform", lambda: "macos")
     monkeypatch.setattr(ws, "package_source_available", lambda platform: True)
-    monkeypatch.setattr(ws, "inspect_tool", lambda name, expectation=None: {
+    monkeypatch.setattr(ws, "inspect_tool", lambda name, expectation=None, **kwargs: {
         "kind": "tool", "tool": name, "installed": "1.0.0", "executable": f"/bin/{name}",
     })
     monkeypatch.setattr(ws, "inspect_docker", lambda platform: ws.docker_status(platform, None, False))
@@ -807,7 +1064,12 @@ def test_confirmed_bootstrap_creates_config_sets_up_then_checks_imports(tmp_path
     bin_dir.mkdir()
     uv = bin_dir / "uv"
     uv.write_text(
-        f"#!{sys.executable}\nimport pathlib\n"
+        f"#!{sys.executable}\nimport pathlib, sys\n"
+        "if sys.argv[1] == 'sync':\n"
+        "    assert not pathlib.Path('.xknx-dev.toml').exists()\n"
+        "    interpreter = pathlib.Path('.workspace/.venv/bin/python')\n"
+        "    interpreter.parent.mkdir(parents=True)\n    interpreter.touch()\n    raise SystemExit(0)\n"
+        "assert pathlib.Path('.workspace/.venv/bin/python').exists()\n"
         "assert pathlib.Path('home-assistant-core/setup.done').exists()\n"
         "pathlib.Path('wiring.done').touch()\n"
     )
@@ -825,7 +1087,7 @@ def test_confirmed_bootstrap_creates_config_sets_up_then_checks_imports(tmp_path
     monkeypatch.setattr(ws, "tmux_status", lambda: {"session": "xknx-dev", "running": False, "windows": []})
     assert ws.run_bootstrap(tmp_path, "default", yes=True, argv=["bootstrap", "--yes"], environ={"XKNX_HA_PORT": str(port)}, progress_mode="quiet") == (1 if outside_import else 0)
     assert (tmp_path / "wiring.done").exists()
-    assert len(list((tmp_path / ".state/logs").glob("*.log"))) == (2 if outside_import else 3)
+    assert len(list((tmp_path / ".state/logs").glob("*.log"))) == (3 if outside_import else 4)
 
 
 @pytest.mark.parametrize("with_yaml", [False, True])
@@ -1287,8 +1549,7 @@ def test_bootstrap_plans_foreground_smoke_and_build_artifact_before_execution(tm
     output = capsys.readouterr().out
     assert "script/build" in output and "temporary foreground" in output and "terminate" in output
     assert observed["smoke_default"] is ws.smoke_default
-    assert observed["expected_artifacts"]["KNX Frontend"]
-    assert all("knx_frontend" in str(path) for path in observed["expected_artifacts"]["KNX Frontend"])
+    assert not observed["expected_artifacts"]
 
 
 def test_bootstrap_reuses_occupied_port_only_for_running_ha_pane(tmp_path: Path, monkeypatch, ha_http_server) -> None:
@@ -1303,7 +1564,7 @@ def test_bootstrap_reuses_occupied_port_only_for_running_ha_pane(tmp_path: Path,
         ws.configuration_action(tmp_path, settings)
 
 
-def test_knx_setup_reruns_only_when_build_artifacts_are_missing(tmp_path: Path, monkeypatch) -> None:
+def test_knx_setup_rebuilds_existing_artifacts_after_every_bootstrap(tmp_path: Path, monkeypatch) -> None:
     fake_planning_tools(monkeypatch)
     monkeypatch.setattr(ws, "nvm_shell", lambda command: command)
     scripts = tmp_path / "knx-frontend/script"
@@ -1334,10 +1595,10 @@ def test_knx_setup_reruns_only_when_build_artifacts_are_missing(tmp_path: Path, 
     assert asyncio.run(controller(plan, progress)) == 0
     assert (scripts.parent / "build-count").read_text() == "1"
     assert asyncio.run(controller(plan, progress)) == 0
-    assert (scripts.parent / "build-count").read_text() == "1"
+    assert (scripts.parent / "build-count").read_text() == "2"
     (scripts.parent / "knx_frontend/frontend_latest/manifest.json").unlink()
     assert asyncio.run(controller(plan, progress)) == 0
-    assert (scripts.parent / "build-count").read_text() == "2"
+    assert (scripts.parent / "build-count").read_text() == "3"
 
 
 def test_bootstrap_smoke_failure_code_reaches_summary(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -1354,6 +1615,7 @@ def test_status_launcher_uses_only_existing_interpreters_without_sync(tmp_path: 
     (controller / "xknx_workspace.py").write_text((ws.ROOT / ".workspace/xknx_workspace.py").read_text())
     launcher = tmp_path / "dev"
     launcher.write_text((ws.ROOT / "dev").read_text())
+    (tmp_path / "bootstrap").write_text((ws.ROOT / "bootstrap").read_text())
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "dirname").symlink_to("/usr/bin/dirname")
@@ -1370,11 +1632,7 @@ def test_status_launcher_uses_only_existing_interpreters_without_sync(tmp_path: 
     uv.write_text(
         f"#!{sys.executable}\nimport os, sys\n"
         "if sys.argv[1:] == ['--version']: print('uv 0.11.0'); raise SystemExit(0)\n"
-        f"assert {not python_available!r}, 'uv must not run when compatible python3 exists'\n"
-        "assert {'--locked', '--no-sync', '--offline', '--no-python-downloads'} <= set(sys.argv)\n"
-        "assert os.environ['UV_PROJECT_ENVIRONMENT'] == sys.argv[sys.argv.index('--project') + 1] + '/.venv'\n"
-        "index = sys.argv.index('--no-python-downloads') + 1\n"
-        "os.execv(sys.argv[index], sys.argv[index:])\n"
+        "raise AssertionError('launcher must not use uv to execute Python')\n"
     )
     uv.chmod(0o755)
     before = sorted(str(path) for path in tmp_path.rglob("*"))
@@ -1387,12 +1645,13 @@ def test_status_launcher_uses_only_existing_interpreters_without_sync(tmp_path: 
 def test_status_launcher_without_python_or_environment_gives_actionable_error(tmp_path: Path) -> None:
     launcher = tmp_path / "dev"
     launcher.write_text((ws.ROOT / "dev").read_text())
+    (tmp_path / "bootstrap").write_text((ws.ROOT / "bootstrap").read_text())
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "dirname").symlink_to("/usr/bin/dirname")
     result = subprocess.run(["/bin/sh", str(launcher), "status", "--format", "json"], env={"PATH": str(bin_dir)}, capture_output=True, text=True, check=False)
     assert result.returncode == 2
-    assert "bootstrap" in result.stderr
+    assert "Python 3.12+" in result.stderr and "python.org" in result.stderr
     assert not (tmp_path / ".workspace").exists()
 
 

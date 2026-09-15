@@ -141,7 +141,15 @@ status` includes diagnostics instead of introducing a separate doctor command.
 Supported systems are macOS, Ubuntu, Debian, and Ubuntu/Debian under WSL 2.
 The bootstrap detects the platform before constructing an installation plan.
 
-Git, `uv`, and `tmux` are checked before project setup. Missing tools are
+An existing Python 3.12+ is required to launch the read-only planning code. The
+launchers directly select the existing root CLI environment or a compatible
+system Python and never synchronize environments before confirmation or
+download Python. Without Rich, a fresh first run keeps complete plain progress.
+A missing root CLI environment is created through a displayed locked sync
+after the normal confirmation; later runs automatically use its Rich renderer.
+Daily commands never synchronize the environment, and existing ones are kept.
+
+Git >= 2.39.0, `uv` >= 0.8.17, and `tmux` >= 3.2 are checked before project setup. Missing tools are
 installed automatically only when a supported package source exists for the
 current operating system. Homebrew is used on macOS and APT on Ubuntu, Debian,
 and supported WSL distributions. The exact command appears in the plan and the
@@ -196,7 +204,9 @@ single invocation.
 
 Secrets are not accepted as command arguments and are redacted from plans and
 logs. Secure KNX material is referenced by local file path rather than copied
-into the workspace configuration. A later invocation of `./dev status` shows
+into the workspace configuration. This validates a readable local reference;
+it does not generate or overwrite Home Assistant's KNX integration. The
+contributor must configure that integration explicitly. A later invocation of `./dev status` shows
 effective non-secret configuration and actionable conflicts.
 
 ## Bootstrap Plan and Execution
@@ -215,9 +225,10 @@ Interactive execution asks once for confirmation. `--yes` accepts the displayed
 plan for non-interactive onboarding. `--progress plain` is used automatically
 without a TTY.
 
-Bootstrap is idempotent. Every task inspects its expected result before acting,
-completed work is reused, and a repeated run resumes by reevaluating the task
-list. It does not need a persistent state database.
+Bootstrap is idempotent. Environments are reused and a repeated run reevaluates
+the task list. KNX frontend always reruns its project-owned bootstrap/build;
+existing artifact files alone cannot prove that a changed checkout is built.
+It does not need a persistent state database.
 
 Repository cloning and independent project setup tasks may run concurrently.
 The default limit is three jobs and may be changed with `--jobs`. A small,
@@ -321,7 +332,10 @@ These checks replace hand-maintained site-packages symlinks.
 
 Node versions come from each repository's `.nvmrc`. NVM is explicitly sourced
 inside every relevant subprocess, so it does not need to alter the invoking
-developer's parent shell. Python versions come from each repository's
+developer's parent shell. Each Node environment's own Corepack enables Yarn
+using the project-owned package-manager declarations. Ruby and Bundler are
+inspected in each docs directory separately. XKNX docs runs on port 4001 and
+Home Assistant docs keeps port 4000; both URLs are in status. Python versions come from each repository's
 `.python-version` and `requires-python`; `uv` creates a separate `.venv` per
 Python repository. Project-owned lockfiles remain authoritative.
 

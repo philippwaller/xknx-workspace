@@ -12,6 +12,71 @@ import pytest
 import xknx_workspace as ws
 
 
+def test_docs_development_ports_and_status_urls_are_distinct(tmp_path: Path, monkeypatch) -> None:
+    jobs = {job.name: job.commands[0] for job in ws.project_development_jobs(tmp_path, "docs")}
+    assert jobs["xknx-docs"] == ["bundle", "exec", "jekyll", "serve", "--port", "4001"]
+    assert jobs["ha-docs"] == ["bundle", "exec", "rake", "preview"]
+    monkeypatch.setattr(ws.shutil, "which", lambda name: None)
+    monkeypatch.setenv("NVM_DIR", str(tmp_path / "absent"))
+    settings = {**ws.load_settings(tmp_path, {}), "profile": "docs"}
+    status = ws.collect_status(tmp_path, settings)
+    assert status["configuration"]["urls"]["xknx-docs"] == "http://127.0.0.1:4001/"
+    assert status["configuration"]["urls"]["ha-docs"] == "http://127.0.0.1:4000/"
+    lines = []
+    ws.render_status(status, print_fn=lines.append)
+    assert "http://127.0.0.1:4001/" in "\n".join(lines) and "http://127.0.0.1:4000/" in "\n".join(lines)
+
+
+@pytest.mark.parametrize("diagnostic", ["docker", "version", "apt", "tmux"])
+def test_preplan_diagnostics_are_bounded_and_timeouts_actionable(tmp_path: Path, monkeypatch, diagnostic) -> None:
+    calls = []
+    def timeout(command, **kwargs):
+        calls.append(command)
+        assert 0 < kwargs.get("timeout", 0) <= 10
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+    monkeypatch.setattr(ws.subprocess, "run", timeout)
+    monkeypatch.setattr(ws.shutil, "which", lambda name: f"/fake/{name}")
+    if diagnostic == "docker":
+        result = ws.inspect_docker("ubuntu")
+        assert result["level"] == "info" and result["available"] is False
+    elif diagnostic == "version":
+        assert ws.inspect_tool("git")["installed"] is None
+    elif diagnostic == "apt":
+        assert ws.missing_tool_actions("ubuntu", {"uv": None})[0]["kind"] == "manual"
+    else:
+        assert not ws._tmux_session_exists(timeout)
+    assert calls
+
+
+@pytest.mark.parametrize("name,version", [("git", "2.38.9"), ("uv", "0.8.0"), ("tmux", "3.1")])
+def test_old_global_tools_block_setup_without_replacement(tmp_path: Path, monkeypatch, capsys, name, version) -> None:
+    expected = {"git": "2.39.0", "uv": "0.8.17", "tmux": "3.2"}
+    monkeypatch.setattr(ws.shutil, "which", lambda tool: f"/bin/{tool}")
+    monkeypatch.setattr(ws.subprocess, "run", lambda command, **kwargs: CompletedProcess(command, 0, version, ""))
+    state = ws.inspect_tool(name)
+    assert state["minimum"] == expected[name] and state["relation"] == "older" and state["blocking"]
+    progress = ws.Progress("plain", log_dir=tmp_path / "logs")
+    job = ws.Job("must-not-start", tmp_path, ([ws.sys.executable, "-c", "raise SystemExit(90)"],))
+    assert asyncio.run(ws.bootstrap_workspace({"root": tmp_path, "tool_actions": [state], "repository_jobs": [job]}, progress)) == 2
+    assert expected[name] in capsys.readouterr().out
+
+
+def test_real_knx_reference_does_not_claim_integration_configuration(tmp_path: Path, monkeypatch) -> None:
+    secure = tmp_path / "private.knxkeys"
+    secure.write_text("do-not-copy-or-print")
+    settings = ws.load_settings(tmp_path, {})
+    settings["knx"] = {"mode": "real", "secure_config_path": str(secure)}
+    action = ws.configuration_action(tmp_path, settings)
+    lines = []
+    ws.render_plan([action], lines.append)
+    assert "configure the KNX integration in Home Assistant" in " ".join(lines)
+    monkeypatch.setattr(ws.shutil, "which", lambda name: None)
+    monkeypatch.setenv("NVM_DIR", str(tmp_path / "absent"))
+    status = ws.collect_status(tmp_path, settings)
+    assert status["configuration"]["knx"]["integration_managed"] is False
+    assert "do-not-copy-or-print" not in json.dumps(status)
+
+
 @pytest.fixture
 def workspace_root() -> Path:
     return Path(__file__).parents[2]
@@ -282,7 +347,7 @@ def test_nvm_shell_sources_nvm_only_for_the_child_command() -> None:
         "-lc",
         'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"; '
         '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; '
-        "nvm install --silent && nvm use --silent && npm run 'build docs'",
+        'nvm install --silent && nvm use --silent && "$NVM_BIN/corepack" enable yarn && npm run \'build docs\'',
     ]
 
 
@@ -307,7 +372,7 @@ def test_bootstrap_plan_contains_context_tools_nvm_and_docker(
     monkeypatch.setattr(
         ws,
         "inspect_tool",
-        lambda name, expectation=None: {
+        lambda name, expectation=None, **kwargs: {
             "kind": "tool",
             "tool": name,
             "executable": None if name in {"uv", "nvm"} else f"/bin/{name}",
@@ -346,7 +411,7 @@ def test_docs_prerequisites_are_scoped_and_never_use_mise(
     monkeypatch.setattr(
         ws,
         "inspect_tool",
-        lambda name, expectation=None: {
+        lambda name, expectation=None, **kwargs: {
             "kind": "tool",
             "tool": name,
             "executable": None,
@@ -371,7 +436,7 @@ def test_each_docs_repository_gets_its_own_ruby_version_decision(
         path.parent.mkdir(parents=True)
         path.write_text(f"{version}\n")
 
-    def inspect(name: str, expectation: str | None = None) -> dict[str, object]:
+    def inspect(name: str, expectation: str | None = None, **kwargs) -> dict[str, object]:
         return {
             "kind": "tool",
             "tool": name,
@@ -387,14 +452,6 @@ def test_each_docs_repository_gets_its_own_ruby_version_decision(
     assert ruby["home-assistant.io"]["expected"] == "3.4.0"
     assert ruby["home-assistant.io"]["kind"] == "manual"
     assert ruby["home-assistant.io"]["blocking"] is True
-
-
-def test_confirmed_plan_digest_rejects_changed_plan() -> None:
-    plan = [{"kind": "package", "command": ["brew", "install", "uv"]}]
-    digest = ws.plan_digest(plan)
-    ws.validate_plan_digest(plan, digest)
-    with pytest.raises(ValueError, match="confirmed plan changed"):
-        ws.validate_plan_digest([*plan, {"kind": "manual", "tool": "git"}], digest)
 
 
 def test_bootstrap_asks_once_then_executes_only_commands(
@@ -418,7 +475,6 @@ def test_bootstrap_asks_once_then_executes_only_commands(
         environ={},
         input_fn=lambda prompt: prompts.append(prompt) or "y",
         runner=lambda command, **kwargs: commands.append(command) or CompletedProcess(command, 0),
-        reexec=lambda *args: None,
     )
 
     assert result == 0
@@ -426,7 +482,7 @@ def test_bootstrap_asks_once_then_executes_only_commands(
     assert commands == [["brew", "install", "git"], ["install-nvm"]]
 
 
-def test_new_uv_reexecs_the_same_script_with_the_confirmed_plan(
+def test_new_uv_continues_without_sync_or_reexec(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     plan = [
@@ -435,8 +491,8 @@ def test_new_uv_reexecs_the_same_script_with_the_confirmed_plan(
     ]
     monkeypatch.setattr(ws, "build_bootstrap_plan", lambda *args, **kwargs: plan)
     monkeypatch.setattr(ws, "load_settings", lambda *args: {})
-    monkeypatch.setattr(ws.shutil, "which", lambda name: "/opt/homebrew/bin/uv")
-    reexecs: list[tuple[str, list[str], dict[str, str]]] = []
+    monkeypatch.setattr(ws, "inspect_tool", lambda name: {"installed": "0.8.17"})
+    commands = []
 
     assert ws.run_bootstrap(
         tmp_path,
@@ -444,22 +500,11 @@ def test_new_uv_reexecs_the_same_script_with_the_confirmed_plan(
         yes=True,
         argv=["bootstrap", "default", "--yes"],
         environ={"PATH": "/opt/homebrew/bin"},
-        runner=lambda command, **kwargs: CompletedProcess(command, 0),
-        reexec=lambda executable, command, environ: reexecs.append((executable, command, environ)),
+        runner=lambda command, **kwargs: commands.append(command) or CompletedProcess(command, 0),
     ) == 0
 
-    executable, command, child_environ = reexecs[0]
-    assert executable == "/opt/homebrew/bin/uv"
-    assert command[:6] == [
-        "/opt/homebrew/bin/uv",
-        "run",
-        "--project",
-        str(tmp_path / ".workspace"),
-        "--locked",
-        "python",
-    ]
-    carried_plan = json.loads(child_environ[ws.CONFIRMED_PLAN_ENV])
-    ws.validate_plan_digest(carried_plan, child_environ[ws.CONFIRMED_PLAN_DIGEST_ENV])
+    assert commands == [["brew", "install", "uv"]]
+    assert not (tmp_path / ".workspace/.venv").exists()
 
 
 def test_missing_uv_requires_manual_installation_instead_of_reexec(
@@ -471,7 +516,6 @@ def test_missing_uv_requires_manual_installation_instead_of_reexec(
     ]
     monkeypatch.setattr(ws, "build_bootstrap_plan", lambda *args, **kwargs: plan)
     monkeypatch.setattr(ws, "load_settings", lambda *args: {})
-    reexecs: list[object] = []
 
     assert ws.run_bootstrap(
         tmp_path,
@@ -480,115 +524,9 @@ def test_missing_uv_requires_manual_installation_instead_of_reexec(
         argv=["bootstrap", "default", "--yes"],
         environ={},
         runner=lambda command, **kwargs: CompletedProcess(command, 0),
-        reexec=lambda *args: reexecs.append(args),
     ) == 2
-    assert reexecs == []
 
 
-def test_reexec_rejects_a_tampered_confirmed_plan(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def unexpected_inspection(*args: object, **kwargs: object) -> list[dict[str, object]]:
-        raise AssertionError("a re-exec must validate its carried plan before inspecting again")
-
-    monkeypatch.setattr(ws, "build_bootstrap_plan", unexpected_inspection)
-    monkeypatch.setattr(ws, "load_settings", lambda *args: {})
-    with pytest.raises(ValueError, match="confirmed plan changed"):
-        ws.run_bootstrap(
-            tmp_path,
-            "default",
-            yes=True,
-            argv=["bootstrap", "default", "--yes"],
-            environ={
-                ws.CONFIRMED_PLAN_ENV: '[{"kind":"installer"}]',
-                ws.CONFIRMED_PLAN_DIGEST_ENV: "0" * 64,
-            },
-        )
-
-
-def test_reexec_accepts_completed_prerequisites_but_rejects_changed_intent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    context = {
-        "kind": "context",
-        "platform": "macos",
-        "profile": "default",
-        "repositories": ws.repositories_for("default"),
-        "settings": {"profile": "default"},
-        "enforce_tool_versions": False,
-    }
-    confirmed = [
-        context,
-        {"kind": "tool", "tool": "uv", "executable": None, "installed": None},
-        {"kind": "package", "command": ["brew", "install", "uv"]},
-    ]
-    current = [
-        context,
-        {"kind": "tool", "tool": "uv", "executable": "/opt/homebrew/bin/uv", "installed": "0.8.17"},
-    ]
-    monkeypatch.setattr(ws, "load_settings", lambda *args: {"profile": "default"})
-    monkeypatch.setattr(ws, "build_bootstrap_plan", lambda *args, **kwargs: current)
-    executions = []
-
-    async def execute(plan, progress):
-        executions.append(plan)
-        return 0
-
-    monkeypatch.setattr(ws, "bootstrap_workspace", execute)
-    environ = {
-        ws.CONFIRMED_PLAN_ENV: ws._serialized_plan(confirmed),
-        ws.CONFIRMED_PLAN_DIGEST_ENV: ws.plan_digest(confirmed),
-    }
-
-    assert ws.run_bootstrap(
-        tmp_path,
-        "default",
-        yes=True,
-        argv=["bootstrap", "default", "--yes"],
-        environ=environ,
-    ) == 0
-    assert {job.name for job in executions[0]["repository_jobs"]} == {
-        "home-assistant-core", "xknx", "xknxproject", "knx-telegram-store", "knx-frontend"
-    }
-
-    current[0] = {**context, "profile": "docs", "repositories": ws.repositories_for("docs")}
-    with pytest.raises(ValueError, match="confirmed bootstrap intent changed"):
-        ws.run_bootstrap(
-            tmp_path,
-            "docs",
-            yes=True,
-            argv=["bootstrap", "docs", "--yes"],
-            environ=environ,
-        )
-
-
-def test_reexec_rejects_a_new_unconfirmed_action(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    context = {
-        "kind": "context",
-        "platform": "macos",
-        "profile": "default",
-        "repositories": ws.repositories_for("default"),
-        "settings": {},
-        "enforce_tool_versions": False,
-    }
-    confirmed = [context, {"kind": "package", "command": ["brew", "install", "uv"]}]
-    current = [context, {"kind": "installer", "command": ["sh", "-c", "unexpected"]}]
-    monkeypatch.setattr(ws, "load_settings", lambda *args: {})
-    monkeypatch.setattr(ws, "build_bootstrap_plan", lambda *args, **kwargs: current)
-
-    with pytest.raises(ValueError, match="unconfirmed prerequisite action"):
-        ws.run_bootstrap(
-            tmp_path,
-            "default",
-            yes=True,
-            argv=["bootstrap", "default", "--yes"],
-            environ={
-                ws.CONFIRMED_PLAN_ENV: ws._serialized_plan(confirmed),
-                ws.CONFIRMED_PLAN_DIGEST_ENV: ws.plan_digest(confirmed),
-            },
-        )
 
 
 @pytest.mark.parametrize(
@@ -1098,8 +1036,8 @@ def test_optional_setup_and_development_commands_keep_frontends_independent(tmp_
     assert development == {
         "knx-frontend": (ws.nvm_shell(["script/develop"]),),
         "home-assistant-frontend": (ws.nvm_shell(["script/develop"]),),
-        "xknxtoolkit": (["uv", "run", "python", "-m", "knx_gui.main"],),
-        "xknx/docs": (["bundle", "exec", "jekyll", "serve"],),
+        "xknxtoolkit": ([str(tmp_path / "xknxtoolkit/.venv/bin/python"), "-m", "knx_gui.main"],),
+        "xknx/docs": (["bundle", "exec", "jekyll", "serve", "--port", "4001"],),
         "home-assistant.io": (["bundle", "exec", "rake", "preview"],),
     }
     assert not any("homeassistant-frontend" in path for path in setup | development)
@@ -1239,14 +1177,6 @@ def test_docs_block_only_their_setup_jobs_after_checkout(tmp_path: Path, monkeyp
     assert (tmp_path / "home-assistant.io/setup.done").exists()
     assert not (tmp_path / "xknx/docs/setup.done").exists()
     assert "9.9.9" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize("kind", ["setup", "wiring", "smoke", "configuration"])
-def test_reexec_rejects_changed_project_actions(kind: str) -> None:
-    confirmed = [{"kind": kind, "command": ["confirmed"]}]
-    current = [{"kind": kind, "command": ["different"]}]
-    with pytest.raises(ValueError, match="unconfirmed project action"):
-        ws.validate_reexec_plan(confirmed, current)
 
 
 def test_bootstrap_revalidates_changed_local_settings_before_prerequisites(tmp_path: Path) -> None:

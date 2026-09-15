@@ -1,16 +1,3 @@
 #!/bin/sh
-set -eu
-root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-if [ "${1:-}" = status ]; then
-    if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2>/dev/null; then
-        exec python3 -B "$root/.workspace/xknx_workspace.py" dev "$@"
-    fi
-    if [ -x "$root/.workspace/.venv/bin/python" ] && command -v uv >/dev/null 2>&1; then
-        export UV_PROJECT_ENVIRONMENT="$root/.workspace/.venv"
-        exec uv run --project "$root/.workspace" --locked --no-sync --offline --no-python-downloads "$root/.workspace/.venv/bin/python" -B "$root/.workspace/xknx_workspace.py" dev "$@"
-    fi
-    printf '%s\n' 'Status needs Python 3.12+ or the existing workspace environment. Run ./bootstrap first.' >&2
-    exit 2
-fi
-command -v uv >/dev/null 2>&1 || { printf '%s\n' 'Run ./bootstrap first.' >&2; exit 2; }
-exec uv run --project "$root/.workspace" --locked python "$root/.workspace/xknx_workspace.py" dev "$@"
+# Share the read-only interpreter selection with bootstrap.
+. "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/bootstrap"
