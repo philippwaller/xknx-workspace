@@ -3,6 +3,7 @@ import json
 import os
 import pty
 import select
+import shlex
 import signal
 import subprocess
 import sys
@@ -906,8 +907,12 @@ def fake_tmux(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Pa
         "command = sys.argv[1]\n"
         "if command == 'has-session': raise SystemExit(0 if state.exists() else 1)\n"
         "if command == 'new-session': state.touch()\n"
+        "elif command == 'new-window' and sys.argv[sys.argv.index('-n') + 1] == os.environ.get('FAKE_TMUX_FAIL_WINDOW'):\n"
+        "    raise SystemExit(int(os.environ['FAKE_TMUX_WINDOW_EXIT']))\n"
         "elif command == 'list-windows': print(os.environ.get('FAKE_TMUX_WINDOWS', ''))\n"
-        "elif command == 'kill-session': state.unlink()\n"
+        "elif command == 'kill-session':\n"
+        "    if code := int(os.environ.get('FAKE_TMUX_KILL_EXIT', '0')): raise SystemExit(code)\n"
+        "    state.unlink()\n"
     )
     executable.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
@@ -928,8 +933,8 @@ def test_existing_tmux_session_attaches_without_restarting_windows(tmp_path: Pat
 
     assert result["action"] == "attach"
     assert tmux_events(events) == [
-        ["has-session", "-t", "xknx-dev"],
-        ["attach-session", "-t", "xknx-dev"],
+        ["has-session", "-t", "=xknx-dev"],
+        ["attach-session", "-t", "=xknx-dev"],
     ]
 
 
@@ -940,8 +945,8 @@ def test_new_tmux_session_creates_only_selected_visible_process_windows(tmp_path
 
     assert result["action"] == "create-and-attach"
     calls = tmux_events(events)
-    assert calls[0] == ["has-session", "-t", "xknx-dev"]
-    assert calls[-1] == ["attach-session", "-t", "xknx-dev"]
+    assert calls[0] == ["has-session", "-t", "=xknx-dev"]
+    assert calls[-1] == ["attach-session", "-t", "=xknx-dev"]
     creations = [call for call in calls if call[0] in {"new-session", "new-window"}]
     assert [call[call.index("-n") + 1] for call in creations] == [
         "overview", "home-assistant", "knx-frontend", "xknx-docs", "ha-docs"
@@ -956,7 +961,8 @@ def test_new_tmux_session_creates_only_selected_visible_process_windows(tmp_path
     process_shells = [call[-1] for call in creations[1:]]
     assert str(tmp_path / "home-assistant-core/.venv/bin/hass") in process_shells[0]
     assert "--skip-pip-packages" in process_shells[0]
-    assert "exec \"$SHELL\" -l" in process_shells[0]
+    assert all(shlex.split(command)[:2] == ["/bin/sh", "-c"] for command in process_shells)
+    assert "exec \"${SHELL:-/bin/sh}\" -l" in shlex.split(process_shells[0])[2]
     assert all("nohup" not in command and "&" not in command.replace("&&", "") and ".pid" not in command for command in process_shells)
     assert not list(tmp_path.glob("*.pid")) and not list((tmp_path / ".state").glob("*.pid"))
 
@@ -979,9 +985,50 @@ def test_tmux_status_is_read_only_and_stop_only_kills_an_existing_session(tmp_pa
     assert "Stopped tmux session xknx-dev." in capsys.readouterr().out
     assert ws.stop_tmux() == 0
     assert tmux_events(events) == [
-        ["has-session", "-t", "xknx-dev"],
-        ["list-windows", "-t", "xknx-dev", "-F", "#{window_name}\t#{pane_dead}\t#{pane_current_command}\t#{pane_dead_status}"],
-        ["has-session", "-t", "xknx-dev"],
-        ["kill-session", "-t", "xknx-dev"],
-        ["has-session", "-t", "xknx-dev"],
+        ["has-session", "-t", "=xknx-dev"],
+        ["list-windows", "-t", "=xknx-dev", "-F", "#{window_name}\t#{pane_dead}\t#{pane_current_command}\t#{pane_dead_status}"],
+        ["has-session", "-t", "=xknx-dev"],
+        ["kill-session", "-t", "=xknx-dev"],
+        ["has-session", "-t", "=xknx-dev"],
     ]
+
+
+@pytest.mark.parametrize(("cleanup_exit", "session_remains"), [(0, False), (31, True)])
+def test_new_window_failure_cleans_up_only_its_session_without_hiding_original_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_exit: int, session_remains: bool
+) -> None:
+    events, state = fake_tmux(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_TMUX_FAIL_WINDOW", "knx-frontend")
+    monkeypatch.setenv("FAKE_TMUX_WINDOW_EXIT", "23")
+    monkeypatch.setenv("FAKE_TMUX_KILL_EXIT", str(cleanup_exit))
+
+    result = ws.start_tmux_command_or_message(
+        "default", root=tmp_path, settings=ws.load_settings(tmp_path, {}), interactive=True
+    )
+
+    assert result == {"action": "error", "returncode": 23}
+    assert state.exists() is session_remains
+    assert tmux_events(events)[-1] == ["kill-session", "-t", "=xknx-dev"]
+    assert not any(call[0] == "attach-session" for call in tmux_events(events))
+
+
+@pytest.mark.parametrize("shell", ["/bin/sh", "/bin/zsh"])
+def test_tmux_failure_wrapper_runs_portably_from_supported_login_shells(
+    tmp_path: Path, shell: str
+) -> None:
+    if not Path(shell).is_file():
+        pytest.skip(f"{shell} is unavailable")
+    recovery = tmp_path / "recovery-shell"
+    recovery.write_text("#!/bin/sh\nexit 0\n")
+    recovery.chmod(0o755)
+
+    result = subprocess.run(
+        [shell, "-c", ws._tmux_process_shell([sys.executable, "-c", "raise SystemExit(7)"])],
+        env={**os.environ, "SHELL": str(recovery)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == "\nProcess exited with status 7.\n"

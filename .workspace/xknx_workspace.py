@@ -94,6 +94,7 @@ CONFIRMED_PLAN_ENV = "XKNX_WORKSPACE_CONFIRMED_PLAN"
 CONFIRMED_PLAN_DIGEST_ENV = "XKNX_WORKSPACE_CONFIRMED_PLAN_SHA256"
 NVM_RELEASE_API = "https://api.github.com/repos/nvm-sh/nvm/releases/latest"
 TMUX_SESSION = "xknx-dev"
+TMUX_TARGET = f"={TMUX_SESSION}"
 TMUX_STATUS_FORMAT = "#{window_name}\t#{pane_dead}\t#{pane_current_command}\t#{pane_dead_status}"
 
 
@@ -684,7 +685,7 @@ def tmux_windows(profile: str) -> tuple[str, ...]:
 
 def _tmux_session_exists(runner=subprocess.run) -> bool:
     return runner(
-        ["tmux", "has-session", "-t", TMUX_SESSION],
+        ["tmux", "has-session", "-t", TMUX_TARGET],
         capture_output=True,
         text=True,
         check=False,
@@ -692,10 +693,12 @@ def _tmux_session_exists(runner=subprocess.run) -> bool:
 
 
 def _tmux_process_shell(command: Sequence[str]) -> str:
-    return (
-        f"{shlex.join(command)}; status=$?; "
-        '[ "$status" -eq 0 ] || { printf \'\\nProcess exited with status %s.\\n\' "$status"; exec "$SHELL" -l; }'
+    command = (
+        f"{shlex.join(command)}; dev_exit=$?; "
+        '[ "$dev_exit" -eq 0 ] || { printf \'\\nProcess exited with status %s.\\n\' "$dev_exit"; '
+        'exec "${SHELL:-/bin/sh}" -l; }'
     )
+    return shlex.join(["/bin/sh", "-c", command])
 
 
 def start_tmux_command_or_message(
@@ -713,7 +716,7 @@ def start_tmux_command_or_message(
         print_fn(f"./dev start {profile}")
         return {"action": "print-command", "returncode": 0}
     if _tmux_session_exists(runner):
-        result = runner(["tmux", "attach-session", "-t", TMUX_SESSION], check=False)
+        result = runner(["tmux", "attach-session", "-t", TMUX_TARGET], check=False)
         return {"action": "attach", "returncode": result.returncode}
 
     root = root.resolve()
@@ -733,11 +736,18 @@ def start_tmux_command_or_message(
         ]
         for job in jobs
     )
+    created = False
     for command in commands:
         result = runner(command, check=False)
         if result.returncode:
+            if created:
+                try:
+                    runner(["tmux", "kill-session", "-t", TMUX_TARGET], check=False)
+                except OSError:
+                    pass
             return {"action": "error", "returncode": result.returncode}
-    result = runner(["tmux", "attach-session", "-t", TMUX_SESSION], check=False)
+        created = True
+    result = runner(["tmux", "attach-session", "-t", TMUX_TARGET], check=False)
     return {"action": "create-and-attach", "returncode": result.returncode}
 
 
@@ -745,7 +755,7 @@ def tmux_status(runner=subprocess.run) -> dict[str, object]:
     if not _tmux_session_exists(runner):
         return {"session": TMUX_SESSION, "running": False, "windows": []}
     result = runner(
-        ["tmux", "list-windows", "-t", TMUX_SESSION, "-F", TMUX_STATUS_FORMAT],
+        ["tmux", "list-windows", "-t", TMUX_TARGET, "-F", TMUX_STATUS_FORMAT],
         capture_output=True,
         text=True,
         check=False,
@@ -768,7 +778,7 @@ def stop_tmux(runner=subprocess.run, print_fn=print) -> int:
     if not _tmux_session_exists(runner):
         print_fn(f"tmux session {TMUX_SESSION} is not running.")
         return 0
-    result = runner(["tmux", "kill-session", "-t", TMUX_SESSION], check=False)
+    result = runner(["tmux", "kill-session", "-t", TMUX_TARGET], check=False)
     if result.returncode == 0:
         print_fn(f"Stopped tmux session {TMUX_SESSION}.")
     return result.returncode
