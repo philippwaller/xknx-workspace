@@ -780,3 +780,17 @@ def test_bootstrap_propagates_first_completed_failure_not_job_order(tmp_path: Pa
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert "exit code 7" in events[-1]["detail"]
     assert any(event["task"] == "skipped" and event["status"] == "skipped" for event in events)
+
+
+def test_sudo_plan_is_executed_once_without_authentication_rewriting(tmp_path: Path) -> None:
+    plan = [{"kind": "package", "command": ["sudo", "apt-get", "install", "-y", "git"]}]
+    lines = []
+    commands = []
+    ws.render_plan(plan, lines.append)
+    results = asyncio.run(ws.run_tool_actions(
+        plan, ws.Progress("quiet", log_dir=tmp_path / "logs"), root=tmp_path,
+        command_runner=lambda command, **kwargs: commands.append(command) or CompletedProcess(command, 0),
+    ))
+    assert lines == ["$ sudo apt-get install -y git"]
+    assert commands == [["sudo", "apt-get", "install", "-y", "git"]]
+    assert len(results) == 1 and results[0].returncode == 0

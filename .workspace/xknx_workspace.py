@@ -264,15 +264,11 @@ async def run_job(job: Job, progress: Progress, *, command_runner=None, verify=N
                 stderr.append(result.stderr or "")
                 returncode = result.returncode
             else:
-                authentication = command == ["sudo", "-v"]
-                cached_sudo = command[:2] == ["sudo", "-n"]
-                # Sudo's credential cache belongs to this terminal session.
+                sudo = Path(command[0]).name == "sudo"
+                # Keep sudo with the controller for authentication and terminal Ctrl+C.
                 process = await asyncio.create_subprocess_exec(
                     *command, cwd=job.cwd, stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    stdin=asyncio.subprocess.DEVNULL if cached_sudo else None,
-                    start_new_session=not (authentication or cached_sudo),
-                    process_group=0 if cached_sudo else None,
+                    stderr=asyncio.subprocess.PIPE, start_new_session=not sudo,
                 )
                 completion = asyncio.gather(
                     read_output(process.stdout, stdout), read_output(process.stderr, stderr), process.wait()
@@ -280,7 +276,7 @@ async def run_job(job: Job, progress: Progress, *, command_runner=None, verify=N
                 try:
                     await asyncio.shield(completion)
                 except (asyncio.CancelledError, KeyboardInterrupt):
-                    await _stop_process(process, completion, group=not authentication)
+                    await _stop_process(process, completion, group=not sudo)
                     raise
                 returncode = 130 if process.returncode == -signal.SIGINT else process.returncode
             if returncode != 0:
@@ -372,12 +368,6 @@ def repository_jobs(root: Path, repositories: Mapping[str, str]) -> list[Job]:
     ]
 
 
-def prerequisite_commands(command: list[str]) -> tuple[list[str], ...]:
-    if command[:2] == ["sudo", "apt-get"]:
-        return (["sudo", "-v"], ["sudo", "-n", *command[1:]])
-    return (command,)
-
-
 async def run_tool_actions(actions, progress: Progress, *, root: Path = ROOT, command_runner=None) -> list[Result]:
     results = []
     failed = False
@@ -405,7 +395,7 @@ async def run_tool_actions(actions, progress: Progress, *, root: Path = ROOT, co
             return None
 
         result = await run_job(
-            Job(name, root, prerequisite_commands(item["command"])), progress,
+            Job(name, root, (item["command"],)), progress,
             command_runner=command_runner, verify=verify,
         )
         results.append(result)
@@ -799,8 +789,7 @@ def validate_reexec_plan(
 def render_plan(plan: Sequence[Mapping[str, object]], print_fn=print, *, secrets: set[str] | None = None) -> None:
     for item in plan:
         if command := item.get("command"):
-            for argv in prerequisite_commands(command):
-                print_fn(f"$ {display_command(argv, secrets)}")
+            print_fn(f"$ {display_command(command, secrets)}")
         elif item.get("kind") == "context":
             print_fn(f"Platform: {item['platform']}  Profile: {item['profile']}")
             print_fn(f"Repositories: {', '.join(item['repositories'])}")

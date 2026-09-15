@@ -458,34 +458,39 @@ def test_cancellation_reaps_fast_and_sigint_ignoring_children(tmp_path: Path) ->
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("mode", ["success", "ctrl-c", "auth-ctrl-c"])
+@pytest.mark.parametrize("mode", ["zero-timeout", "nopasswd", "ctrl-c", "auth-ctrl-c"])
 def test_sudo_authentication_preserves_terminal_and_ctrl_c_reaps_package_work(tmp_path: Path, mode: str) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     sudo = bin_dir / "sudo"
-    sudo.write_text(
-        f"#!{sys.executable}\n"
-        "import json, os, pathlib, signal, sys, time\n"
-        "args = sys.argv[1:]\n"
-        "with open('sudo-commands', 'a') as out: out.write(json.dumps(args) + '\\n')\n"
-        "tty = os.open('/dev/tty', os.O_RDWR)\n"
-        "if args == ['-v'] or args[0] == 'apt-get':\n"
-        "    pathlib.Path('auth.pid').write_text(str(os.getpid()))\n"
-        "    assert os.tcgetpgrp(tty) == os.getpgrp()\n"
-        "    os.write(tty, b'AUTH PASSWORD\\n')\n"
-        "    assert os.read(tty, 100).strip() == b'answer'\n"
-        "    pathlib.Path('sudo-cache').write_text(str(os.fstat(tty).st_rdev))\n"
-        "    if args == ['-v']: sys.exit(0)\n"
-        "else:\n"
-        "    assert args == ['-n', 'apt-get', 'install', '-y', 'git']\n"
-        "    assert pathlib.Path('sudo-cache').read_text() == str(os.fstat(tty).st_rdev)\n"
+    package_work = (
+        "import os, pathlib, signal, sys, time\n"
+        "assert os.isatty(0) and os.tcgetpgrp(0) == os.getpgrp()\n"
         "signal.signal(signal.SIGINT, lambda *args: pathlib.Path('ignored-sigint').touch())\n"
         "def terminate(*args):\n"
         "    pathlib.Path('terminated').touch()\n"
         "    sys.exit(0)\n"
         "signal.signal(signal.SIGTERM, terminate)\n"
         "pathlib.Path('package.pid').write_text(str(os.getpid()))\n"
-        "if os.environ['TASK4_TEST_MODE'] != 'success': time.sleep(30)\n"
+        "if os.environ['TASK4_TEST_MODE'] == 'ctrl-c': time.sleep(30)\n"
+    )
+    sudo.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, pathlib, sys\n"
+        "args = sys.argv[1:]\n"
+        "mode = os.environ['TASK4_TEST_MODE']\n"
+        "with open('sudo-commands', 'a') as out: out.write(json.dumps(args) + '\\n')\n"
+        "if args == ['-v'] and mode == 'nopasswd': sys.exit(11)\n"
+        "if args[0] == '-n': sys.exit(12)\n"
+        "assert args in (['-v'], ['apt-get', 'install', '-y', 'git'])\n"
+        "if mode != 'nopasswd':\n"
+        "    pathlib.Path('auth.pid').write_text(str(os.getpid()))\n"
+        "    tty = os.open('/dev/tty', os.O_RDWR)\n"
+        "    assert os.tcgetpgrp(tty) == os.getpgrp()\n"
+        "    os.write(tty, b'AUTH PASSWORD\\n')\n"
+        "    assert os.read(tty, 100).strip() == b'answer'\n"
+        "if args == ['-v']: sys.exit(0)\n"
+        f"os.execv(sys.executable, [sys.executable, '-c', {package_work!r}])\n"
     )
     sudo.chmod(0o755)
     controller = (
@@ -497,7 +502,7 @@ def test_sudo_authentication_preserves_terminal_and_ctrl_c_reaps_package_work(tm
         f"os.environ['TASK4_TEST_MODE'] = {mode!r}\n"
         "ws.build_bootstrap_plan = lambda *args, **kwargs: [{'kind': 'package', 'command': ['sudo', 'apt-get', 'install', '-y', 'git']}]\n"
         "code = ws.run_bootstrap(root, 'default', yes=False, argv=['bootstrap'], progress_mode='quiet')\n"
-        f"assert code == {0 if mode == 'success' else 130}\n"
+        f"assert code == {0 if mode in {'zero-timeout', 'nopasswd'} else 130}\n"
         "assert os.tcgetpgrp(0) == os.getpgrp()\n"
         "for path in root.glob('*.pid'):\n"
         "    try: os.kill(int(path.read_text()), 0)\n"
@@ -549,14 +554,16 @@ def test_sudo_authentication_preserves_terminal_and_ctrl_c_reaps_package_work(tm
                     break
                 time.sleep(0.01)
         assert reaped and os.waitstatus_to_exitcode(status) == 0, output.decode(errors="replace")
-        assert confirmed and answered and usable
-        assert b"sudo -v" in output and b"sudo -n apt-get install -y git" in output
+        assert confirmed and usable
+        assert answered == (mode != "nopasswd")
+        assert b"sudo apt-get install -y git" in output
+        assert b"sudo -v" not in output and b"sudo -n" not in output
+        commands = [json.loads(line) for line in (tmp_path / "sudo-commands").read_text().splitlines()]
+        assert commands == [["apt-get", "install", "-y", "git"]]
         log = next((tmp_path / ".state/logs").glob("*.log")).read_text()
-        assert '["sudo", "-v"]' in log
+        assert 'argv: [["sudo", "apt-get", "install", "-y", "git"]]' in log
         if mode == "auth-ctrl-c":
             assert not (tmp_path / "package.pid").exists()
-        else:
-            assert '["sudo", "-n", "apt-get", "install", "-y", "git"]' in log
         if mode == "ctrl-c":
             assert (tmp_path / "ignored-sigint").exists()
             assert (tmp_path / "terminated").exists()
