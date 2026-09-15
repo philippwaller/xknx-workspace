@@ -16,7 +16,6 @@ import sys
 import time
 import tomllib
 import urllib.request
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -213,10 +212,13 @@ class Progress:
             self.live = None
 
 
-async def _stop_process(process, completion) -> None:
+async def _stop_process(process, completion, *, group: bool = True) -> None:
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
         try:
-            os.killpg(process.pid, sig)
+            if group:
+                os.killpg(process.pid, sig)
+            else:
+                process.send_signal(sig)
         except ProcessLookupError:
             pass
         try:
@@ -227,37 +229,7 @@ async def _stop_process(process, completion) -> None:
     await completion
 
 
-def _set_terminal_group(terminal: int, group: int) -> None:
-    previous = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
-    try:
-        os.tcsetpgrp(terminal, group)
-    finally:
-        signal.signal(signal.SIGTTOU, previous)
-
-
-@contextmanager
-def _foreground_terminal(process, interactive: bool):
-    terminal = None
-    restore = False
-    try:
-        if interactive:
-            try:
-                terminal = os.open("/dev/tty", os.O_RDWR)
-            except OSError:
-                pass
-        if terminal is not None and os.tcgetpgrp(terminal) == os.getpgrp() and process.returncode is None:
-            restore = True
-            _set_terminal_group(terminal, process.pid)
-            os.killpg(process.pid, signal.SIGCONT)
-        yield
-    finally:
-        if terminal is not None:
-            if restore:
-                _set_terminal_group(terminal, os.getpgrp())
-            os.close(terminal)
-
-
-async def run_job(job: Job, progress: Progress, *, command_runner=None, verify=None, interactive: bool = False) -> Result:
+async def run_job(job: Job, progress: Progress, *, command_runner=None, verify=None) -> Result:
     start, clock_start = datetime.now(timezone.utc), time.monotonic()
     # ponytail: buffer each task's output; spool to disk if build logs exhaust memory.
     stdout: list[str] = []
@@ -292,20 +264,24 @@ async def run_job(job: Job, progress: Progress, *, command_runner=None, verify=N
                 stderr.append(result.stderr or "")
                 returncode = result.returncode
             else:
+                authentication = command == ["sudo", "-v"]
+                cached_sudo = command[:2] == ["sudo", "-n"]
+                # Sudo's credential cache belongs to this terminal session.
                 process = await asyncio.create_subprocess_exec(
                     *command, cwd=job.cwd, stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE, start_new_session=not interactive,
-                    process_group=0 if interactive else None,
+                    stderr=asyncio.subprocess.PIPE,
+                    stdin=asyncio.subprocess.DEVNULL if cached_sudo else None,
+                    start_new_session=not (authentication or cached_sudo),
+                    process_group=0 if cached_sudo else None,
                 )
                 completion = asyncio.gather(
                     read_output(process.stdout, stdout), read_output(process.stderr, stderr), process.wait()
                 )
-                with _foreground_terminal(process, interactive):
-                    try:
-                        await asyncio.shield(completion)
-                    except (asyncio.CancelledError, KeyboardInterrupt):
-                        await _stop_process(process, completion)
-                        raise
+                try:
+                    await asyncio.shield(completion)
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    await _stop_process(process, completion, group=not authentication)
+                    raise
                 returncode = 130 if process.returncode == -signal.SIGINT else process.returncode
             if returncode != 0:
                 break
@@ -396,6 +372,12 @@ def repository_jobs(root: Path, repositories: Mapping[str, str]) -> list[Job]:
     ]
 
 
+def prerequisite_commands(command: list[str]) -> tuple[list[str], ...]:
+    if command[:2] == ["sudo", "apt-get"]:
+        return (["sudo", "-v"], ["sudo", "-n", *command[1:]])
+    return (command,)
+
+
 async def run_tool_actions(actions, progress: Progress, *, root: Path = ROOT, command_runner=None) -> list[Result]:
     results = []
     failed = False
@@ -423,7 +405,8 @@ async def run_tool_actions(actions, progress: Progress, *, root: Path = ROOT, co
             return None
 
         result = await run_job(
-            Job(name, root, (item["command"],)), progress, command_runner=command_runner, verify=verify, interactive=True
+            Job(name, root, prerequisite_commands(item["command"])), progress,
+            command_runner=command_runner, verify=verify,
         )
         results.append(result)
         failed = result.returncode != 0
@@ -816,7 +799,8 @@ def validate_reexec_plan(
 def render_plan(plan: Sequence[Mapping[str, object]], print_fn=print, *, secrets: set[str] | None = None) -> None:
     for item in plan:
         if command := item.get("command"):
-            print_fn(f"$ {display_command(command, secrets)}")
+            for argv in prerequisite_commands(command):
+                print_fn(f"$ {display_command(argv, secrets)}")
         elif item.get("kind") == "context":
             print_fn(f"Platform: {item['platform']}  Profile: {item['profile']}")
             print_fn(f"Repositories: {', '.join(item['repositories'])}")

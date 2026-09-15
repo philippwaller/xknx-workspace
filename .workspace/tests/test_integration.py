@@ -458,42 +458,66 @@ def test_cancellation_reaps_fast_and_sigint_ignoring_children(tmp_path: Path) ->
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("cancel", [True, False], ids=["cancel", "ctrl-c"])
-def test_interactive_prerequisite_keeps_tty_and_restores_it_after_cancellation(tmp_path: Path, cancel: bool) -> None:
-    child_code = "import os, pathlib, signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); pathlib.Path('auth.pid').write_text(str(os.getpid())); tty = os.open('/dev/tty', os.O_RDWR); assert os.tcgetpgrp(tty) == os.getpgrp(); os.write(tty, b'AUTH\\n'); assert os.read(tty, 100).strip() == b'answer'; pathlib.Path('authenticated').touch(); time.sleep(30)"
-    if not cancel:
-        child_code = child_code.replace("signal.SIG_IGN", "signal.SIG_DFL")
+@pytest.mark.parametrize("mode", ["success", "ctrl-c", "auth-ctrl-c"])
+def test_sudo_authentication_preserves_terminal_and_ctrl_c_reaps_package_work(tmp_path: Path, mode: str) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    sudo = bin_dir / "sudo"
+    sudo.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, pathlib, signal, sys, time\n"
+        "args = sys.argv[1:]\n"
+        "with open('sudo-commands', 'a') as out: out.write(json.dumps(args) + '\\n')\n"
+        "tty = os.open('/dev/tty', os.O_RDWR)\n"
+        "if args == ['-v'] or args[0] == 'apt-get':\n"
+        "    pathlib.Path('auth.pid').write_text(str(os.getpid()))\n"
+        "    assert os.tcgetpgrp(tty) == os.getpgrp()\n"
+        "    os.write(tty, b'AUTH PASSWORD\\n')\n"
+        "    assert os.read(tty, 100).strip() == b'answer'\n"
+        "    pathlib.Path('sudo-cache').write_text(str(os.fstat(tty).st_rdev))\n"
+        "    if args == ['-v']: sys.exit(0)\n"
+        "else:\n"
+        "    assert args == ['-n', 'apt-get', 'install', '-y', 'git']\n"
+        "    assert pathlib.Path('sudo-cache').read_text() == str(os.fstat(tty).st_rdev)\n"
+        "signal.signal(signal.SIGINT, lambda *args: pathlib.Path('ignored-sigint').touch())\n"
+        "def terminate(*args):\n"
+        "    pathlib.Path('terminated').touch()\n"
+        "    sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, terminate)\n"
+        "pathlib.Path('package.pid').write_text(str(os.getpid()))\n"
+        "if os.environ['TASK4_TEST_MODE'] != 'success': time.sleep(30)\n"
+    )
+    sudo.chmod(0o755)
     controller = (
-        "import asyncio, os, pathlib, sys\n"
+        "import os, pathlib, sys\n"
         f"sys.path.insert(0, {str(Path(ws.__file__).parent)!r})\n"
         "import xknx_workspace as ws\n"
         f"root = pathlib.Path({str(tmp_path)!r})\n"
-        "async def exercise():\n"
-        f"    plan = {{'root': root, 'tool_actions': [{{'kind': 'package', 'command': [sys.executable, '-c', {child_code!r}]}}]}}\n"
-        "    execution = asyncio.create_task(ws.bootstrap_workspace(plan, ws.Progress('quiet', log_dir=root / 'logs')))\n"
-        "    async with asyncio.timeout(5):\n"
-        "        while not (root / 'authenticated').exists():\n"
-        "            if execution.done(): raise AssertionError('authentication did not run')\n"
-        "            await asyncio.sleep(0.01)\n"
-        f"    if {cancel}: execution.cancel()\n"
-        "    assert await execution == 130\n"
-        "    assert os.tcgetpgrp(0) == os.getpgrp()\n"
-        "    try: os.kill(int((root / 'auth.pid').read_text()), 0)\n"
+        f"os.environ['PATH'] = {str(bin_dir)!r} + os.pathsep + os.environ['PATH']\n"
+        f"os.environ['TASK4_TEST_MODE'] = {mode!r}\n"
+        "ws.build_bootstrap_plan = lambda *args, **kwargs: [{'kind': 'package', 'command': ['sudo', 'apt-get', 'install', '-y', 'git']}]\n"
+        "code = ws.run_bootstrap(root, 'default', yes=False, argv=['bootstrap'], progress_mode='quiet')\n"
+        f"assert code == {0 if mode == 'success' else 130}\n"
+        "assert os.tcgetpgrp(0) == os.getpgrp()\n"
+        "for path in root.glob('*.pid'):\n"
+        "    try: os.kill(int(path.read_text()), 0)\n"
         "    except ProcessLookupError: pass\n"
-        "    else: raise AssertionError('interactive child survived cancellation')\n"
-        "asyncio.run(exercise())\n"
+        "    else: raise AssertionError('test child survived bootstrap')\n"
+        "assert input('TERMINAL READY\\n') == 'done'\n"
     )
     pid, terminal = pty.fork()
     if pid == 0:
         os.execv(sys.executable, [sys.executable, "-c", controller])
     output = b""
+    confirmed = False
     answered = False
     interrupted = False
+    usable = False
     reaped = False
     try:
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            if not cancel and not interrupted and (tmp_path / "authenticated").exists():
+            if mode == "ctrl-c" and not interrupted and (tmp_path / "package.pid").exists():
                 os.write(terminal, b"\x03")
                 interrupted = True
             if select.select([terminal], [], [], 0.05)[0]:
@@ -504,25 +528,46 @@ def test_interactive_prerequisite_keeps_tty_and_restores_it_after_cancellation(t
                 if not chunk:
                     break
                 output += chunk
-                if b"AUTH\r\n" in output and not answered:
-                    os.write(terminal, b"answer\n")
+                if b"Execute this plan?" in output and not confirmed:
+                    os.write(terminal, b"y\n")
+                    confirmed = True
+                if b"AUTH PASSWORD\r\n" in output and not answered:
+                    os.write(terminal, b"\x03" if mode == "auth-ctrl-c" else b"answer\n")
                     answered = True
+                if b"TERMINAL READY\r\n" in output and not usable:
+                    os.write(terminal, b"done\n")
+                    usable = True
             finished, status = os.waitpid(pid, os.WNOHANG)
             if finished:
                 reaped = True
                 break
         if not reaped:
-            finished, status = os.waitpid(pid, os.WNOHANG)
-            reaped = bool(finished)
+            while time.monotonic() < deadline:
+                finished, status = os.waitpid(pid, os.WNOHANG)
+                if finished:
+                    reaped = True
+                    break
+                time.sleep(0.01)
         assert reaped and os.waitstatus_to_exitcode(status) == 0, output.decode(errors="replace")
-        assert answered and (tmp_path / "authenticated").exists()
+        assert confirmed and answered and usable
+        assert b"sudo -v" in output and b"sudo -n apt-get install -y git" in output
+        log = next((tmp_path / ".state/logs").glob("*.log")).read_text()
+        assert '["sudo", "-v"]' in log
+        if mode == "auth-ctrl-c":
+            assert not (tmp_path / "package.pid").exists()
+        else:
+            assert '["sudo", "-n", "apt-get", "install", "-y", "git"]' in log
+        if mode == "ctrl-c":
+            assert (tmp_path / "ignored-sigint").exists()
+            assert (tmp_path / "terminated").exists()
+            assert "returncode: 130" in log
     finally:
         if not reaped:
             os.kill(pid, signal.SIGKILL)
             os.waitpid(pid, 0)
-        child_pid = tmp_path / "auth.pid"
-        if child_pid.exists() and process_is_alive(int(child_pid.read_text())):
-            os.kill(int(child_pid.read_text()), signal.SIGKILL)
+        for child_pid in tmp_path.glob("*.pid"):
+            if process_is_alive(int(child_pid.read_text())):
+                os.kill(int(child_pid.read_text()), signal.SIGKILL)
         os.close(terminal)
 
 
