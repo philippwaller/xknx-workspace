@@ -1,9 +1,15 @@
 import asyncio
 import json
 import os
+import pty
+import select
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
+
+import pytest
 
 import xknx_workspace as ws
 
@@ -415,3 +421,119 @@ def test_bootstrap_runs_prerequisites_before_local_repository_jobs_with_json_out
     assert (root / "prerequisite.done").exists()
     assert (root / "xknx/.git").exists()
     assert len(list((root / ".state/logs").glob("*.log"))) == 2
+
+
+def process_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_cancellation_reaps_fast_and_sigint_ignoring_children(tmp_path: Path) -> None:
+    async def exercise():
+        jobs = []
+        pids = []
+        for name in ("fast", "stubborn"):
+            command = [sys.executable, "-c", "import os, pathlib, signal, sys, time; name = sys.argv[1]; signal.signal(signal.SIGINT, lambda *args: sys.exit(0) if name == 'fast' else None); pathlib.Path(name + '.pid').write_text(str(os.getpid())); time.sleep(30)", name]
+            jobs.append(ws.Job(name, tmp_path, (command,)))
+        plan = {"root": tmp_path, "tool_actions": [], "jobs": 2, "repository_jobs": jobs, "project_setup_jobs": []}
+        execution = asyncio.create_task(ws.bootstrap_workspace(plan, ws.Progress("quiet", log_dir=tmp_path / "logs")))
+        try:
+            async with asyncio.timeout(5):
+                while not all((tmp_path / f"{name}.pid").exists() for name in ("fast", "stubborn")):
+                    await asyncio.sleep(0.01)
+            pids = [int((tmp_path / f"{name}.pid").read_text()) for name in ("fast", "stubborn")]
+            execution.cancel()
+            assert await asyncio.wait_for(execution, 5) == 130
+            assert not any(process_is_alive(pid) for pid in pids)
+            assert len(list((tmp_path / "logs").glob("*.log"))) == 2
+        finally:
+            for pid in pids:
+                if process_is_alive(pid):
+                    os.kill(pid, signal.SIGKILL)
+            await asyncio.sleep(0.05)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("cancel", [True, False], ids=["cancel", "ctrl-c"])
+def test_interactive_prerequisite_keeps_tty_and_restores_it_after_cancellation(tmp_path: Path, cancel: bool) -> None:
+    child_code = "import os, pathlib, signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); pathlib.Path('auth.pid').write_text(str(os.getpid())); tty = os.open('/dev/tty', os.O_RDWR); assert os.tcgetpgrp(tty) == os.getpgrp(); os.write(tty, b'AUTH\\n'); assert os.read(tty, 100).strip() == b'answer'; pathlib.Path('authenticated').touch(); time.sleep(30)"
+    if not cancel:
+        child_code = child_code.replace("signal.SIG_IGN", "signal.SIG_DFL")
+    controller = (
+        "import asyncio, os, pathlib, sys\n"
+        f"sys.path.insert(0, {str(Path(ws.__file__).parent)!r})\n"
+        "import xknx_workspace as ws\n"
+        f"root = pathlib.Path({str(tmp_path)!r})\n"
+        "async def exercise():\n"
+        f"    plan = {{'root': root, 'tool_actions': [{{'kind': 'package', 'command': [sys.executable, '-c', {child_code!r}]}}]}}\n"
+        "    execution = asyncio.create_task(ws.bootstrap_workspace(plan, ws.Progress('quiet', log_dir=root / 'logs')))\n"
+        "    async with asyncio.timeout(5):\n"
+        "        while not (root / 'authenticated').exists():\n"
+        "            if execution.done(): raise AssertionError('authentication did not run')\n"
+        "            await asyncio.sleep(0.01)\n"
+        f"    if {cancel}: execution.cancel()\n"
+        "    assert await execution == 130\n"
+        "    assert os.tcgetpgrp(0) == os.getpgrp()\n"
+        "    try: os.kill(int((root / 'auth.pid').read_text()), 0)\n"
+        "    except ProcessLookupError: pass\n"
+        "    else: raise AssertionError('interactive child survived cancellation')\n"
+        "asyncio.run(exercise())\n"
+    )
+    pid, terminal = pty.fork()
+    if pid == 0:
+        os.execv(sys.executable, [sys.executable, "-c", controller])
+    output = b""
+    answered = False
+    interrupted = False
+    reaped = False
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if not cancel and not interrupted and (tmp_path / "authenticated").exists():
+                os.write(terminal, b"\x03")
+                interrupted = True
+            if select.select([terminal], [], [], 0.05)[0]:
+                try:
+                    chunk = os.read(terminal, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                output += chunk
+                if b"AUTH\r\n" in output and not answered:
+                    os.write(terminal, b"answer\n")
+                    answered = True
+            finished, status = os.waitpid(pid, os.WNOHANG)
+            if finished:
+                reaped = True
+                break
+        if not reaped:
+            finished, status = os.waitpid(pid, os.WNOHANG)
+            reaped = bool(finished)
+        assert reaped and os.waitstatus_to_exitcode(status) == 0, output.decode(errors="replace")
+        assert answered and (tmp_path / "authenticated").exists()
+    finally:
+        if not reaped:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        child_pid = tmp_path / "auth.pid"
+        if child_pid.exists() and process_is_alive(int(child_pid.read_text())):
+            os.kill(int(child_pid.read_text()), signal.SIGKILL)
+        os.close(terminal)
+
+
+def test_quoted_secrets_are_redacted_from_job_and_private_repository_output(tmp_path: Path, monkeypatch, capsys) -> None:
+    secret = "privatehead'privatetail"
+    monkeypatch.setenv("TASK4_TOKEN", secret)
+    progress = ws.Progress("plain", log_dir=tmp_path / "logs", secrets={secret})
+    job = ws.Job("quoted", tmp_path, ([sys.executable, "-c", "import sys; print(sys.argv[1])", secret],))
+    assert asyncio.run(ws.run_jobs([job], progress=progress))[0].returncode == 0
+    repository_job = ws.repository_jobs(tmp_path, {"xknx": str(tmp_path / secret / "missing.git")})
+    assert asyncio.run(ws.run_jobs(repository_job, progress=progress))[0].returncode != 0
+    content = capsys.readouterr().out + "".join(path.read_text() for path in (tmp_path / "logs").glob("*.log"))
+    assert "privatehead" not in content and "privatetail" not in content
+    assert "***" in content

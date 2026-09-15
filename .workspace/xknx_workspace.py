@@ -16,6 +16,7 @@ import sys
 import time
 import tomllib
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -118,9 +119,15 @@ def secret_values(environ: Mapping[str, str] = os.environ) -> set[str]:
 
 def redact(text: str, secrets: set[str]) -> str:
     for value in sorted(filter(None, secrets), key=len, reverse=True):
-        text = text.replace(json.dumps(value)[1:-1], "***")
-        text = text.replace(value, "***")
+        for form in (value.replace("'", "'\"'\"'"), value):
+            text = text.replace(json.dumps(form)[1:-1], "***")
+            text = text.replace(form, "***")
     return text
+
+
+def display_command(command: Sequence[str], secrets: set[str] | None = None) -> str:
+    values = secret_values() | (secrets or set())
+    return shlex.join(redact(argument, values) for argument in command)
 
 
 def write_task_log(
@@ -165,6 +172,7 @@ class Progress:
         self.rows: dict[str, tuple[str, str]] = {}
         self.live = None
         self.first_error = False
+        self.first_returncode = 0
 
     def emit(self, task: str, status: str, detail: str) -> None:
         task, detail = (redact(value, self.secrets) for value in (task, detail))
@@ -179,7 +187,7 @@ class Progress:
                 self.mode = "plain"
         if self.mode == "json":
             print(json.dumps({"task": task, "status": status, "detail": detail}), flush=True)
-        elif self.mode != "quiet" or status == "summary" or (status == "error" and not self.first_error):
+        elif self.mode != "quiet" or status in {"planned", "summary"} or (status == "error" and not self.first_error):
             print(f"{task}: {status}: {detail}", flush=True)
         if status == "error":
             self.first_error = True
@@ -219,7 +227,37 @@ async def _stop_process(process, completion) -> None:
     await completion
 
 
-async def run_job(job: Job, progress: Progress, *, command_runner=None, verify=None) -> Result:
+def _set_terminal_group(terminal: int, group: int) -> None:
+    previous = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    try:
+        os.tcsetpgrp(terminal, group)
+    finally:
+        signal.signal(signal.SIGTTOU, previous)
+
+
+@contextmanager
+def _foreground_terminal(process, interactive: bool):
+    terminal = None
+    restore = False
+    try:
+        if interactive:
+            try:
+                terminal = os.open("/dev/tty", os.O_RDWR)
+            except OSError:
+                pass
+        if terminal is not None and os.tcgetpgrp(terminal) == os.getpgrp() and process.returncode is None:
+            restore = True
+            _set_terminal_group(terminal, process.pid)
+            os.killpg(process.pid, signal.SIGCONT)
+        yield
+    finally:
+        if terminal is not None:
+            if restore:
+                _set_terminal_group(terminal, os.getpgrp())
+            os.close(terminal)
+
+
+async def run_job(job: Job, progress: Progress, *, command_runner=None, verify=None, interactive: bool = False) -> Result:
     start, clock_start = datetime.now(timezone.utc), time.monotonic()
     # ponytail: buffer each task's output; spool to disk if build logs exhaust memory.
     stdout: list[str] = []
@@ -247,7 +285,7 @@ async def run_job(job: Job, progress: Progress, *, command_runner=None, verify=N
     try:
         for command in job.commands:
             commands.append(command)
-            progress.emit(job.name, "running", f"$ {shlex.join(command)}")
+            progress.emit(job.name, "running", f"$ {display_command(command, progress.secrets)}")
             if command_runner is not None:
                 result = command_runner(command, cwd=job.cwd, capture_output=True, text=True, check=False)
                 stdout.append(result.stdout or "")
@@ -256,17 +294,19 @@ async def run_job(job: Job, progress: Progress, *, command_runner=None, verify=N
             else:
                 process = await asyncio.create_subprocess_exec(
                     *command, cwd=job.cwd, stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE, start_new_session=True,
+                    stderr=asyncio.subprocess.PIPE, start_new_session=not interactive,
+                    process_group=0 if interactive else None,
                 )
                 completion = asyncio.gather(
                     read_output(process.stdout, stdout), read_output(process.stderr, stderr), process.wait()
                 )
-                try:
-                    await asyncio.shield(completion)
-                except (asyncio.CancelledError, KeyboardInterrupt):
-                    await _stop_process(process, completion)
-                    raise
-                returncode = process.returncode
+                with _foreground_terminal(process, interactive):
+                    try:
+                        await asyncio.shield(completion)
+                    except (asyncio.CancelledError, KeyboardInterrupt):
+                        await _stop_process(process, completion)
+                        raise
+                returncode = 130 if process.returncode == -signal.SIGINT else process.returncode
             if returncode != 0:
                 break
         if returncode == 0 and verify is not None:
@@ -299,6 +339,7 @@ async def run_jobs(
     if limit < 1:
         raise ValueError("jobs must be positive")
     progress = progress or Progress()
+    progress.first_returncode = 0
     queue = asyncio.Queue()
     results: dict[int, Result] = {}
     failed = False
@@ -326,6 +367,8 @@ async def run_jobs(
                 progress.emit(job.name, "error", str(error))
             results[index] = result
             if result.returncode != 0:
+                if result.status != "skipped" and progress.first_returncode == 0:
+                    progress.first_returncode = result.returncode
                 failed = True
 
     workers = [asyncio.create_task(worker()) for _ in range(min(limit, len(jobs)))]
@@ -334,7 +377,8 @@ async def run_jobs(
     except asyncio.CancelledError:
         failed = True
         for worker_task in workers:
-            worker_task.cancel()
+            if not worker_task.cancelling():
+                worker_task.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
         raise
     finally:
@@ -379,7 +423,7 @@ async def run_tool_actions(actions, progress: Progress, *, root: Path = ROOT, co
             return None
 
         result = await run_job(
-            Job(name, root, (item["command"],)), progress, command_runner=command_runner, verify=verify
+            Job(name, root, (item["command"],)), progress, command_runner=command_runner, verify=verify, interactive=True
         )
         results.append(result)
         failed = result.returncode != 0
@@ -406,13 +450,15 @@ async def bootstrap_workspace(plan: dict[str, object], progress: Progress) -> in
         pending = list(plan.get("project_setup_jobs", ()))
         results = await run_jobs(plan.get("repository_jobs", ()), plan.get("jobs", 3), progress)
         if not all(result.returncode == 0 for result in results):
-            return 1
+            code = progress.first_returncode or 1
+            return code
         pending = []
         results = await run_jobs(
             plan.get("project_setup_jobs", ()), plan.get("jobs", 3), progress, expected=plan.get("expected_artifacts")
         )
         if not all(result.returncode == 0 for result in results):
-            return 1
+            code = progress.first_returncode or 1
+            return code
         if wire := plan.get("wire_home_assistant"):
             pending_callbacks.remove("wire_home_assistant")
             if not await wire(plan, progress):
@@ -767,10 +813,10 @@ def validate_reexec_plan(
         raise ValueError("re-exec introduced an unconfirmed prerequisite action")
 
 
-def render_plan(plan: Sequence[Mapping[str, object]], print_fn=print) -> None:
+def render_plan(plan: Sequence[Mapping[str, object]], print_fn=print, *, secrets: set[str] | None = None) -> None:
     for item in plan:
         if command := item.get("command"):
-            print_fn(f"$ {shlex.join(command)}")
+            print_fn(f"$ {display_command(command, secrets)}")
         elif item.get("kind") == "context":
             print_fn(f"Platform: {item['platform']}  Profile: {item['profile']}")
             print_fn(f"Repositories: {', '.join(item['repositories'])}")
@@ -856,7 +902,7 @@ def run_bootstrap(
     try:
         if not marker:
             lines = []
-            render_plan(plan, lines.append)
+            render_plan(plan, lines.append, secrets=progress.secrets)
             for index, line in enumerate(lines):
                 progress.emit(f"plan-{index + 1}", "planned", line)
             if not yes:
@@ -1101,16 +1147,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
 
         def logged_git(command, **kwargs):
-            print(f"$ {shlex.join(command)}", flush=True)
+            values = secret_values()
+            print(f"$ {display_command(command, values)}", flush=True)
             result = subprocess.run(command, **kwargs)
             if result.stdout:
-                print(result.stdout, end="", flush=True)
+                print(redact(result.stdout, values), end="", flush=True)
             if result.stderr:
-                print(result.stderr, end="", file=sys.stderr, flush=True)
+                print(redact(result.stderr, values), end="", file=sys.stderr, flush=True)
             return result
 
         status = ensure_repository(Path(argv[1]), argv[2], logged_git)
-        print(json.dumps(status), flush=True)
+        print(redact(json.dumps(status), secret_values()), flush=True)
         return 1 if status["error"] else 0
     try:
         args = build_parser().parse_args(argv)

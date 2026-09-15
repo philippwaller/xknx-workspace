@@ -676,7 +676,7 @@ def test_bootstrap_stops_phases_and_reports_dependent_jobs_skipped(tmp_path: Pat
         "wire_home_assistant": not_called,
         "smoke_default": not_called,
     }
-    assert asyncio.run(ws.bootstrap_workspace(plan, ws.Progress("json", log_dir=tmp_path / "logs"))) == 1
+    assert asyncio.run(ws.bootstrap_workspace(plan, ws.Progress("json", log_dir=tmp_path / "logs"))) == 127
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert any(event["task"] == "setup" and event["status"] == "skipped" for event in events)
     assert not any(event["task"] == "setup" and event["status"] == "running" for event in events)
@@ -744,3 +744,39 @@ def test_tty_plan_keeps_every_action_visible_before_confirmation(tmp_path: Path,
     planned = [detail for status, detail in frames[-1].values() if status == "planned"]
     assert any("first-install" in detail for detail in planned)
     assert any("second-install" in detail for detail in planned)
+
+
+def test_quiet_plan_is_visible_before_confirmation_and_execution_stays_quiet(tmp_path: Path, monkeypatch, capsys) -> None:
+    secret = "head'tail"
+    plan = [{"kind": "package", "command": ["first-install", secret]}, {"kind": "installer", "command": ["second-install"]}]
+    monkeypatch.setattr(ws, "build_bootstrap_plan", lambda *args, **kwargs: plan)
+
+    def confirm(prompt):
+        output = capsys.readouterr().out
+        assert "first-install" in output and "second-install" in output
+        assert "head" not in output and "tail" not in output
+        assert "***" in output and "[y/N]" in prompt
+        return "y"
+
+    assert ws.run_bootstrap(
+        tmp_path, "default", yes=False, argv=["bootstrap"], progress_mode="quiet",
+        environ={"TEST_TOKEN": secret}, input_fn=confirm,
+        runner=lambda command, **kwargs: CompletedProcess(command, 0, "detail", ""),
+    ) == 0
+    output = capsys.readouterr().out
+    assert len(output.splitlines()) == 1 and "summary" in output
+
+
+@pytest.mark.parametrize("phase", ["repository_jobs", "project_setup_jobs"])
+def test_bootstrap_propagates_first_completed_failure_not_job_order(tmp_path: Path, phase: str, capsys) -> None:
+    command = lambda delay, code: [ws.sys.executable, "-c", f"import time, sys; time.sleep({delay}); sys.exit({code})"]
+    plan = {"root": tmp_path, "tool_actions": [], "jobs": 2, "repository_jobs": [], "project_setup_jobs": []}
+    plan[phase] = [
+        ws.Job("later-failure", tmp_path, (command(0.2, 9),)),
+        ws.Job("first-failure", tmp_path, (command(0.01, 7),)),
+        ws.Job("skipped", tmp_path, (["must-not-run"],)),
+    ]
+    assert asyncio.run(ws.bootstrap_workspace(plan, ws.Progress("json", log_dir=tmp_path / "logs"))) == 7
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert "exit code 7" in events[-1]["detail"]
+    assert any(event["task"] == "skipped" and event["status"] == "skipped" for event in events)
