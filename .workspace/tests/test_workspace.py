@@ -797,6 +797,30 @@ def test_finish_renders_actionable_failure_and_success(monkeypatch: pytest.Monke
     assert "http://localhost:8123" in " ".join(rendered)
 
 
+def test_finish_prefers_completed_smoke_failure_over_early_check_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rendered: list[str] = []
+    progress = ws.Progress("tty")
+    monkeypatch.setattr(progress, "_render_tty", lambda: None)
+    monkeypatch.setattr(progress, "_render_summary_tty", lambda lines, error: rendered.extend(lines))
+    progress.emit("smoke-http", "error", "Home Assistant is not ready")
+    progress.emit("smoke-home-assistant", "running", "home-assistant")
+    progress.emit(
+        "smoke-home-assistant", "error",
+        "Smoke exit 7; log: /workspace/.state/logs/smoke.log", duration=1.2,
+    )
+
+    progress.finish(7, profile="default")
+
+    summary = " ".join(rendered)
+    assert "smoke-home-assistant" in summary
+    assert "home-assistant" in summary
+    assert "Smoke exit 7" in summary
+    assert "/workspace/.state/logs/smoke.log" in summary
+    assert "Home Assistant is not ready" not in summary
+
+
 def test_bootstrap_stops_phases_and_reports_dependent_jobs_skipped(tmp_path: Path, capsys) -> None:
     async def not_called(plan, progress):
         raise AssertionError("Dependent phase must not start")

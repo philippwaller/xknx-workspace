@@ -201,6 +201,7 @@ class Progress:
         self.live = None
         self.first_error = False
         self.first_failure: tuple[str, str] | None = None
+        self.first_failure_complete = False
         self.first_returncode = 0
 
     def emit(self, task: str, status: str, detail: str, duration: float | None = None) -> None:
@@ -209,9 +210,12 @@ class Progress:
         detail = " ".join(detail.splitlines())
         previous = self.rows.get(task)
         self.rows[task] = (status, detail, duration)
-        if status == "error" and self.first_failure is None:
+        if status == "error" and (
+            self.first_failure is None or duration is not None and not self.first_failure_complete
+        ):
             substep = f"{previous[1]} — " if previous and previous[0] == "running" else ""
             self.first_failure = (task, f"{substep}{detail}")
+            self.first_failure_complete = duration is not None
         if self.mode == "tty":
             try:
                 self._render_tty()
@@ -1163,13 +1167,17 @@ async def smoke_default(plan: dict[str, object], progress: Progress, *, timeout:
             progress.emit("smoke-home-assistant", "running", "Stopping and reaping temporary foreground Home Assistant child")
             await _stop_process(process, completion)
             stdout, stderr = await completion
+        duration = time.monotonic() - clock_start
         log = write_task_log(
             progress.log_dir, "smoke-home-assistant", command=[command] if process is not None else [],
             cwd=root / "home-assistant-core", stdout=stdout.decode(errors="replace") + "\n" + json.dumps(plan.get("smoke", {})), stderr=stderr.decode(errors="replace"),
-            returncode=code, start=start, duration=time.monotonic() - clock_start,
+            returncode=code, start=start, duration=duration,
             secrets=progress.secrets, versions=progress.versions, decisions=progress.decisions,
         )
-        progress.emit("smoke-home-assistant", "success" if code == 0 else "error", f"Smoke exit {code}; log: {log}")
+        progress.emit(
+            "smoke-home-assistant", "success" if code == 0 else "error",
+            f"Smoke exit {code}; log: {log}", duration=duration,
+        )
 
 
 async def wire_home_assistant(plan: Mapping[str, object], progress: Progress) -> int:
