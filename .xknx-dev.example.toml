@@ -1,0 +1,8 @@
+profile = "default"
+
+[home_assistant]
+port = 8123
+config_dir = "home-assistant-core/config"
+
+[knx]
+mode = "automatic"

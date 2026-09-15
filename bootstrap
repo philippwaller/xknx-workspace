@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if command -v uv >/dev/null 2>&1; then
+  exec uv run --project "$root/.workspace" --locked python "$root/.workspace/xknx_workspace.py" bootstrap "$@"
+fi
+if command -v python3 >/dev/null 2>&1; then
+  exec python3 "$root/.workspace/xknx_workspace.py" bootstrap "$@"
+fi
+printf '%s\n' "Python 3 is required to display the bootstrap plan."
+exit 2

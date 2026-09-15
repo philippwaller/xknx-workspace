@@ -15,4 +15,7 @@
 !/bootstrap
 !/dev
 !/.xknx-dev.example.toml
+/.workspace/**/__pycache__/
+/.xknx-dev.toml
+/.state/
 !/.gitignore
