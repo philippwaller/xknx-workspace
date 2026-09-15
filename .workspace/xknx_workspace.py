@@ -97,7 +97,7 @@ CONFIRMED_PLAN_DIGEST_ENV = "XKNX_WORKSPACE_CONFIRMED_PLAN_SHA256"
 NVM_RELEASE_API = "https://api.github.com/repos/nvm-sh/nvm/releases/latest"
 TMUX_SESSION = "xknx-dev"
 TMUX_TARGET = f"={TMUX_SESSION}"
-TMUX_STATUS_FORMAT = "#{window_name}\t#{pane_dead}\t#{pane_current_command}\t#{pane_dead_status}\t#{pane_start_command}\t#{pane_current_path}"
+TMUX_STATUS_FORMAT = "#{window_name}\t#{pane_dead}\t#{pane_current_command}\t#{pane_dead_status}\t#{pane_start_command}\t#{pane_current_path}\t#{@xknx-ha-active}"
 KNX_FRONTEND_ARTIFACTS = (
     "knx-frontend/knx_frontend/__init__.py", "knx-frontend/knx_frontend/constants.py",
     "knx-frontend/knx_frontend/frontend_latest/manifest.json",
@@ -712,13 +712,31 @@ def _tmux_session_exists(runner=subprocess.run) -> bool:
     ).returncode == 0
 
 
-def _tmux_process_shell(command: Sequence[str]) -> str:
-    command = (
-        f"{shlex.join(command)}; dev_exit=$?; "
-        '[ "$dev_exit" -eq 0 ] || { printf \'\\nProcess exited with status %s.\\n\' "$dev_exit"; '
-        'exec "${SHELL:-/bin/sh}" -l; }'
+def _ha_command_fingerprint(command: Sequence[str]) -> str:
+    return hashlib.sha256(json.dumps(list(command)).encode()).hexdigest()
+
+
+def _tmux_process_shell(command: Sequence[str], *, track_ha: bool = False) -> str:
+    before = after = failed_clear = ""
+    if track_ha:
+        marker = '[ -n "${TMUX_PANE:-}" ] && tmux set-option -p -t "$TMUX_PANE" @xknx-ha-active'
+        before = (
+            f"{marker} {_ha_command_fingerprint(command)} || "
+            "printf 'Could not set HA lifecycle marker; pane reuse is unavailable.\\n'; "
+        )
+        after = f"dev_marker_exit=0; {marker} '' || dev_marker_exit=$?; "
+        # Never leave a stale active marker on a recovery shell if clearing fails.
+        failed_clear = (
+            '[ "$dev_marker_exit" -eq 0 ] || { '
+            "printf 'Could not clear HA lifecycle marker; closing pane without a recovery shell.\\n'; "
+            'exit "$dev_exit"; }; '
+        )
+    script = (
+        f"{before}{shlex.join(command)}; dev_exit=$?; {after}"
+        '[ "$dev_exit" -eq 0 ] || printf \'\\nProcess exited with status %s.\\n\' "$dev_exit"; '
+        f'{failed_clear}[ "$dev_exit" -eq 0 ] || exec "${{SHELL:-/bin/sh}}" -l'
     )
-    return shlex.join(["/bin/sh", "-c", command])
+    return shlex.join(["/bin/sh", "-c", script])
 
 
 def start_tmux_command_or_message(
@@ -752,7 +770,7 @@ def start_tmux_command_or_message(
     commands.extend(
         [
             "tmux", "new-window", "-d", "-t", f"{TMUX_SESSION}:",
-            "-n", job.name, "-c", str(job.cwd), _tmux_process_shell(job.commands[0]),
+            "-n", job.name, "-c", str(job.cwd), _tmux_process_shell(job.commands[0], track_ha=job.name == "home-assistant"),
         ]
         for job in jobs
     )
@@ -784,7 +802,7 @@ def tmux_status(runner=subprocess.run) -> dict[str, object]:
         return {"session": TMUX_SESSION, "running": False, "windows": [], "error": result.stderr.strip()}
     windows = []
     for line in result.stdout.splitlines():
-        name, dead, command, exit_code, start_command, cwd = line.split("\t", 5)
+        name, dead, command, exit_code, start_command, cwd, ha_active = line.split("\t", 6)
         windows.append({
             "name": name,
             "dead": dead == "1",
@@ -792,6 +810,7 @@ def tmux_status(runner=subprocess.run) -> dict[str, object]:
             "exit_code": int(exit_code) if exit_code else None,
             "start_command": start_command,
             "cwd": cwd,
+            "ha_active": ha_active,
         })
     return {"session": TMUX_SESSION, "running": True, "windows": windows}
 
@@ -933,6 +952,8 @@ def _home_assistant_pane_matches(window: Mapping[str, object], root: Path, setti
     if not re.fullmatch(r"hass|python(?:\d+(?:\.\d+)*)?", Path(window["command"]).name):
         return False
     command = home_assistant_command(root, {**DEFAULTS["home_assistant"], **settings.get("home_assistant", {})})
+    if window.get("ha_active") != _ha_command_fingerprint(command):
+        return False
     try:
         started = shlex.split(window.get("start_command", ""))
         # tmux quotes a single shell-command argument when formatting its argv.
@@ -940,7 +961,7 @@ def _home_assistant_pane_matches(window: Mapping[str, object], root: Path, setti
             started = shlex.split(started[0])
     except ValueError:
         return False
-    return started == command or started == shlex.split(_tmux_process_shell(command))
+    return started == command or started == shlex.split(_tmux_process_shell(command, track_ha=True))
 
 
 def process_status(profile: str, *, root: Path = ROOT, settings: Mapping[str, object] | None = None) -> dict[str, object]:
@@ -961,7 +982,8 @@ def process_status(profile: str, *, root: Path = ROOT, settings: Mapping[str, ob
         elif window["dead"]:
             state, detail = "exited", f"{name} exited {window['exit_code']}; {action}"
         elif name == "home-assistant" and not _home_assistant_pane_matches(window, root, settings or DEFAULTS):
-            state, detail = "command", f"home-assistant pane does not match this workspace's HA executable/config or current HA process; {action}"
+            action = f"inspect {TMUX_SESSION}:home-assistant; ./dev stop && ./dev start {profile} (recreate the session when ready)"
+            state, detail = "command", f"home-assistant pane lacks this workspace's active lifecycle marker, expected HA executable/config, or current HA process; {action}"
         elif name != "overview" and Path(window["command"]).name in {"sh", "bash", "zsh", "fish", "dash", "ksh"}:
             state, detail = "command", f"{name} has a shell, not a confirmed service; {action}"
         else:
