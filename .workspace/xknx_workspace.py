@@ -543,7 +543,16 @@ def repository_status(path: Path, runner=subprocess.run) -> dict[str, object]:
     default_ref = _git_output(path, runner, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
     branch_result = _git(path, runner, "symbolic-ref", "--short", "HEAD")
     branch = branch_result.stdout.strip() if branch_result.returncode == 0 else "HEAD"
-    dirty = bool(_git_output(path, runner, "status", "--porcelain=v1"))
+    dirty = bool(
+        _git_output(
+            path,
+            runner,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        )
+    )
     ahead, behind = map(
         int,
         _git_output(
@@ -570,32 +579,45 @@ def repository_status(path: Path, runner=subprocess.run) -> dict[str, object]:
 
 
 def safe_update(path: Path, runner=subprocess.run) -> dict[str, object]:
+    status = None
     try:
         _git_output(path, runner, "fetch", "origin", "--prune")
-    except RuntimeError as error:
-        try:
-            status = repository_status(path, runner)
-        except RuntimeError:
-            return _empty_repository_status(path, str(error), "error")
-        status.update(action="error", error=str(error))
-        return status
-    status = repository_status(path, runner)
-    decision = update_decision(
-        {
-            **status,
-            "on_default": status["branch"] == status["default_branch"],
-            "clean": not status["dirty"],
-        }
-    )
-    if decision == "fast-forward":
-        ancestor = _git(path, runner, "merge-base", "--is-ancestor", "HEAD", "refs/remotes/origin/HEAD")
-        if ancestor.returncode == 0:
+        status = repository_status(path, runner)
+        decision = update_decision(
+            {
+                **status,
+                "on_default": status["branch"] == status["default_branch"],
+                "clean": not status["dirty"],
+            }
+        )
+        if decision == "fast-forward":
+            ancestor = _git(
+                path,
+                runner,
+                "merge-base",
+                "--is-ancestor",
+                "HEAD",
+                "refs/remotes/origin/HEAD",
+            )
+            if ancestor.returncode > 1:
+                raise RuntimeError(ancestor.stderr.strip() or "git merge-base failed")
+            if ancestor.returncode:
+                status["action"] = "unchanged"
+                return status
             _git_output(path, runner, "merge", "--ff-only", "refs/remotes/origin/HEAD")
             status = repository_status(path, runner)
             status["action"] = "fast-forwarded"
             return status
-    status["action"] = "unchanged" if decision == "report-only" else "fetched"
-    return status
+        status["action"] = "unchanged" if decision == "report-only" else "fetched"
+        return status
+    except RuntimeError as error:
+        if status is None:
+            try:
+                status = repository_status(path, runner)
+            except RuntimeError:
+                return _empty_repository_status(path, str(error), "error")
+        status.update(action="error", error=str(error))
+        return status
 
 
 def _empty_repository_status(
@@ -622,28 +644,33 @@ def ensure_repository(path: Path, origin: str, runner=subprocess.run) -> dict[st
         actual_origin = _git(path, runner, "remote", "get-url", "origin")
         if actual_origin.returncode or actual_origin.stdout.strip() != origin:
             return _empty_repository_status(path, "existing repository origin differs from catalog")
-        return safe_update(path, runner)
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    clone = runner(
-        ["git", "clone", origin, str(path)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if clone.returncode:
-        return _empty_repository_status(
-            path, clone.stderr.strip() or "git clone failed", "error"
+        status = safe_update(path, runner)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        clone = runner(
+            ["git", "clone", origin, str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
         )
-    if path.name == "knx-frontend" and not (path / "homeassistant-frontend" / ".git").exists():
+        if clone.returncode:
+            return _empty_repository_status(
+                path, clone.stderr.strip() or "git clone failed", "error"
+            )
+        try:
+            status = repository_status(path, runner)
+        except RuntimeError as error:
+            return _empty_repository_status(path, str(error), "error")
+        status["action"] = "cloned"
+    if (
+        status["error"] is None
+        and path.name == "knx-frontend"
+        and not (path / "homeassistant-frontend" / ".git").exists()
+    ):
         try:
             _git_output(path, runner, "submodule", "update", "--init", "homeassistant-frontend")
         except RuntimeError as error:
-            status = repository_status(path, runner)
             status.update(action="error", error=str(error))
-            return status
-    status = repository_status(path, runner)
-    status["action"] = "cloned"
     return status
 
 
