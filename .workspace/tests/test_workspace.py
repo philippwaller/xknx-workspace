@@ -3,7 +3,6 @@ import builtins
 import json
 import socket
 import subprocess
-from io import BytesIO
 from pathlib import Path
 from subprocess import CompletedProcess
 
@@ -42,7 +41,7 @@ def test_preplan_diagnostics_are_bounded_and_timeouts_actionable(tmp_path: Path,
     elif diagnostic == "version":
         assert ws.inspect_tool("git")["installed"] is None
     elif diagnostic == "apt":
-        assert ws.missing_tool_actions("ubuntu", {"uv": None})[0]["kind"] == "manual"
+        assert ws.prerequisite_guidance("ubuntu", {"uv": None})[0]["kind"] == "manual"
     else:
         assert not ws._tmux_session_exists(timeout)
     assert calls
@@ -135,19 +134,6 @@ def test_automation_is_bounded_and_does_not_start_background_services(
     assert "./dev start" not in smoke and "./dev stop" not in smoke
 
 
-class FakeResponse(BytesIO):
-    def __init__(
-        self,
-        payload: bytes,
-        url: str = "https://api.github.com/repos/nvm-sh/nvm/releases/latest",
-    ) -> None:
-        super().__init__(payload)
-        self.url = url
-
-    def geturl(self) -> str:
-        return self.url
-
-
 def test_documentation_and_skill_contract(workspace_root: Path) -> None:
     skill = workspace_root / ".agents/skills/bootstrap-xknx-workspace/SKILL.md"
     metadata = workspace_root / ".agents/skills/bootstrap-xknx-workspace/agents/openai.yaml"
@@ -218,94 +204,56 @@ def test_default_platform_detection_includes_the_kernel_release(monkeypatch: pyt
     assert ws.detect_platform(os_release="ID=debian\n") == "wsl-debian"
 
 
-def test_macos_missing_tools_use_one_brew_command() -> None:
-    actions = ws.missing_tool_actions("macos", {"git": None, "uv": None, "tmux": None})
-    assert [action["command"] for action in actions] == [["brew", "install", "git", "uv", "tmux"]]
-
-
-def test_apt_does_not_claim_an_unavailable_uv_package() -> None:
-    actions = ws.missing_tool_actions(
-        "ubuntu", {"git": None, "uv": None, "tmux": None}, apt_packages={"git", "tmux"}
+def test_missing_macos_prerequisites_are_guidance_not_jobs() -> None:
+    guidance = ws.prerequisite_guidance(
+        "macos", {"git": None, "uv": None, "tmux": None}
     )
-    assert ["sudo", "apt-get", "install", "-y", "git", "tmux"] in [a["command"] for a in actions]
-    assert any(a["kind"] == "manual" and a["tool"] == "uv" for a in actions)
+    assert guidance == [{
+        "kind": "manual",
+        "blocking": True,
+        "tools": ("git", "uv", "tmux"),
+        "command": ["brew", "install", "git", "uv", "tmux"],
+    }]
 
 
-def test_existing_tool_is_never_replaced_without_enforcement() -> None:
-    decision = ws.version_decision("nvm", installed="0.39.7", expected="0.40.3", enforce=False)
-    assert decision == {"action": "keep", "relation": "older", "installed": "0.39.7", "expected": "0.40.3"}
-
-
-def test_versions_are_compared_numerically_and_enforced_only_on_request() -> None:
-    assert ws.version_decision("nvm", "0.9.0", "0.40.3", enforce=True)["action"] == "replace"
-    assert ws.version_decision("nvm", "0.41.0", "0.40.3", enforce=False)["relation"] == "newer"
-    assert ws.version_decision("ruby", "3.4", "3.4.0", enforce=False)["relation"] == "current"
-
-
-def test_missing_package_source_is_a_manual_action() -> None:
-    assert ws.missing_tool_actions(
-        "macos", {"git": None}, package_source_available=False
-    ) == [
-        {
-            "kind": "manual",
-            "tool": "homebrew",
-            "command": [],
-            "link": "https://brew.sh/",
-        }
-    ]
-
-
-def test_nvm_installer_is_versioned_official_source() -> None:
-    assert ws.nvm_install_action("v0.40.3") == {
-        "tool": "nvm",
-        "version": "0.40.3",
-        "command": [
-            "sh",
-            "-c",
-            'tmp=$(mktemp) && trap \'rm -f "$tmp"\' EXIT && '
-            "curl -fsS --location --max-redirs 0 --proto '=https' "
-            '-o "$tmp" https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh && '
-            'PROFILE=/dev/null bash "$tmp"',
-        ],
-    }
-
-
-def test_nvm_installer_propagates_a_curl_failure(tmp_path: Path) -> None:
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    curl = bin_dir / "curl"
-    curl.write_text("#!/bin/sh\nexit 7\n")
-    curl.chmod(0o755)
-
-    result = subprocess.run(
-        ws.nvm_install_action("v0.40.3")["command"],
-        env={"HOME": str(tmp_path), "PATH": f"{bin_dir}:/usr/bin:/bin"},
-        check=False,
-    )
-
-    assert result.returncode != 0
-
-
-def test_bootstrap_verifies_nvm_after_the_installer(
+def test_missing_nvm_is_blocking_and_never_resolves_or_runs_an_installer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    plan = [{"kind": "installer", "tool": "nvm", "command": ["install-nvm"]}]
-    monkeypatch.setattr(ws, "build_bootstrap_plan", lambda *args, **kwargs: plan)
-    monkeypatch.setattr(ws, "load_settings", lambda *args: {})
+    monkeypatch.setattr(ws, "detect_platform", lambda: "macos")
     monkeypatch.setattr(
         ws,
         "inspect_tool",
-        lambda name: {"kind": "tool", "tool": name, "executable": None, "installed": None},
+        lambda name, **kwargs: {
+            "kind": "tool", "tool": name,
+            "executable": None if name == "nvm" else f"/bin/{name}",
+            "installed": None if name == "nvm" else "99.0",
+        },
     )
+    monkeypatch.setattr(
+        ws, "inspect_docker",
+        lambda platform: ws.docker_status(platform, executable=None, daemon_reachable=False),
+    )
+    plan = ws.build_bootstrap_plan(tmp_path, "default", {"profile": "default"})
+    nvm = next(item for item in plan if item.get("tool") == "nvm")
+    assert nvm["blocking"] is True
+    assert nvm.get("command") is None
+    assert nvm["link"] == "https://github.com/nvm-sh/nvm#installing-and-updating"
 
-    assert ws.run_bootstrap(
-        tmp_path,
-        "default",
-        yes=True,
-        argv=["bootstrap", "default", "--yes"],
-        environ={},
-        runner=lambda command, **kwargs: CompletedProcess(command, 0),
-    ) == 2
+
+def test_prerequisite_failure_changes_no_workspace_state(tmp_path: Path) -> None:
+    plan = {
+        "root": tmp_path,
+        "tool_actions": [{
+            "kind": "tool", "tool": "git", "installed": None,
+            "minimum": "2.39.0", "blocking": True,
+        }],
+        "repository_jobs": [ws.Job("must-not-run", tmp_path, (["false"],))],
+    }
+    progress = ws.Progress("quiet", log_dir=tmp_path / "logs")
+    before = sorted(tmp_path.rglob("*"))
+    code = asyncio.run(ws.bootstrap_workspace(plan, progress))
+    assert code == 2
+    assert sorted(tmp_path.rglob("*")) == before
 
 
 def test_missing_docker_is_warning_not_failure() -> None:
@@ -319,26 +267,6 @@ def test_unreachable_docker_daemon_has_a_platform_start_action() -> None:
     result = ws.docker_status("ubuntu", executable="/usr/bin/docker", daemon_reachable=False)
     assert result["level"] == "info"
     assert result["start_command"] == ["sudo", "systemctl", "start", "docker"]
-
-
-def test_nvm_release_is_resolved_from_an_exact_official_tag() -> None:
-    opener = lambda *_args, **_kwargs: FakeResponse(b'{"tag_name": "v0.40.3"}')
-    assert ws.resolve_nvm_release(opener=opener) == "v0.40.3"
-
-
-def test_nvm_release_rejects_a_floating_ref() -> None:
-    opener = lambda *_args, **_kwargs: FakeResponse(b'{"tag_name": "master"}')
-    with pytest.raises(ValueError, match="invalid NVM release"):
-        ws.resolve_nvm_release(opener=opener)
-
-
-def test_nvm_release_rejects_an_api_redirect() -> None:
-    opener = lambda *_args, **_kwargs: FakeResponse(
-        b'{"tag_name": "v0.40.3"}',
-        "https://api.github.com/repositories/612230/releases/latest",
-    )
-    with pytest.raises(ValueError, match="redirected NVM release API"):
-        ws.resolve_nvm_release(opener=opener)
 
 
 def test_nvm_shell_sources_nvm_only_for_the_child_command() -> None:
@@ -368,7 +296,6 @@ def test_bootstrap_plan_contains_context_tools_nvm_and_docker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(ws, "detect_platform", lambda: "macos")
-    monkeypatch.setattr(ws, "package_source_available", lambda platform: True)
     monkeypatch.setattr(
         ws,
         "inspect_tool",
@@ -377,9 +304,9 @@ def test_bootstrap_plan_contains_context_tools_nvm_and_docker(
             "tool": name,
             "executable": None if name in {"uv", "nvm"} else f"/bin/{name}",
             "installed": None,
+            "blocking": name in {"uv", "nvm"},
         },
     )
-    monkeypatch.setattr(ws, "resolve_nvm_release", lambda: "v0.40.3")
     monkeypatch.setattr(
         ws,
         "inspect_docker",
@@ -394,10 +321,9 @@ def test_bootstrap_plan_contains_context_tools_nvm_and_docker(
         "profile": "default",
         "repositories": ws.repositories_for("default"),
         "settings": {"profile": "default"},
-        "enforce_tool_versions": False,
     }
-    assert any(item.get("command") == ["brew", "install", "uv"] for item in plan)
-    assert any(item.get("tool") == "nvm" and item.get("version") == "0.40.3" for item in plan)
+    assert any(item.get("tool") == "uv" and item.get("blocking") is True for item in plan)
+    assert any(item.get("tool") == "nvm" and item.get("blocking") is True for item in plan)
     assert any(item.get("tool") == "docker" and item.get("required") is False for item in plan)
 
 
@@ -454,85 +380,10 @@ def test_each_docs_repository_gets_its_own_ruby_version_decision(
     assert ruby["home-assistant.io"]["blocking"] is True
 
 
-def test_bootstrap_asks_once_then_executes_only_commands(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    plan = [
-        {"kind": "package", "command": ["brew", "install", "git"]},
-        {"kind": "diagnostic", "tool": "docker", "level": "warning"},
-        {"kind": "installer", "command": ["install-nvm"]},
-    ]
-    monkeypatch.setattr(ws, "build_bootstrap_plan", lambda *args, **kwargs: plan)
-    monkeypatch.setattr(ws, "load_settings", lambda *args: {})
-    prompts: list[str] = []
-    commands: list[list[str]] = []
-
-    result = ws.run_bootstrap(
-        tmp_path,
-        "default",
-        yes=False,
-        argv=["bootstrap", "default"],
-        environ={},
-        input_fn=lambda prompt: prompts.append(prompt) or "y",
-        runner=lambda command, **kwargs: commands.append(command) or CompletedProcess(command, 0),
-    )
-
-    assert result == 0
-    assert len(prompts) == 1
-    assert commands == [["brew", "install", "git"], ["install-nvm"]]
-
-
-def test_new_uv_continues_without_sync_or_reexec(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    plan = [
-        {"kind": "tool", "tool": "uv", "executable": None, "installed": None},
-        {"kind": "package", "command": ["brew", "install", "uv"]},
-    ]
-    monkeypatch.setattr(ws, "build_bootstrap_plan", lambda *args, **kwargs: plan)
-    monkeypatch.setattr(ws, "load_settings", lambda *args: {})
-    monkeypatch.setattr(ws, "inspect_tool", lambda name: {"installed": "0.8.17"})
-    commands = []
-
-    assert ws.run_bootstrap(
-        tmp_path,
-        "default",
-        yes=True,
-        argv=["bootstrap", "default", "--yes"],
-        environ={"PATH": "/opt/homebrew/bin"},
-        runner=lambda command, **kwargs: commands.append(command) or CompletedProcess(command, 0),
-    ) == 0
-
-    assert commands == [["brew", "install", "uv"]]
-    assert not (tmp_path / ".workspace/.venv").exists()
-
-
-def test_missing_uv_requires_manual_installation_instead_of_reexec(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    plan = [
-        {"kind": "tool", "tool": "uv", "executable": None, "installed": None},
-        {"kind": "manual", "tool": "uv", "command": [], "link": "https://example.invalid"},
-    ]
-    monkeypatch.setattr(ws, "build_bootstrap_plan", lambda *args, **kwargs: plan)
-    monkeypatch.setattr(ws, "load_settings", lambda *args: {})
-
-    assert ws.run_bootstrap(
-        tmp_path,
-        "default",
-        yes=True,
-        argv=["bootstrap", "default", "--yes"],
-        environ={},
-        runner=lambda command, **kwargs: CompletedProcess(command, 0),
-    ) == 2
-
-
-
-
 @pytest.mark.parametrize(
     ("argv",),
     [
-        (["bootstrap", "default", "--yes", "--jobs", "2", "--progress", "plain", "--verbose", "--enforce-tool-versions"],),
+        (["bootstrap", "default", "--yes", "--jobs", "2", "--progress", "plain", "--verbose"],),
         (["dev", "start", "frontend"],),
         (["dev", "status", "--format", "json"],),
         (["dev", "update", "docs", "--progress", "quiet"],),
@@ -929,61 +780,12 @@ def test_bootstrap_forwards_execution_options(monkeypatch) -> None:
     assert options["verbose"] is True
 
 
-def test_tool_failure_reports_unstarted_actions_and_verification_in_its_log(tmp_path: Path, monkeypatch, capsys) -> None:
-    monkeypatch.setattr(ws, "inspect_tool", lambda name: {"installed": None})
-    actions = [
-        {"kind": "installer", "tool": "nvm", "command": ["install-nvm"], "version": "0.40.3"},
-        {"kind": "package", "command": ["must-not-run"]},
-    ]
-    progress = ws.Progress("json", log_dir=tmp_path / "logs")
-    results = asyncio.run(ws.run_tool_actions(
-        actions, progress, root=tmp_path,
-        command_runner=lambda command, **kwargs: CompletedProcess(command, 0),
-    ))
-    assert [(result.returncode, result.status) for result in results] == [(2, "error"), (1, "skipped")]
-    log = next((tmp_path / "logs").glob("*.log")).read_text()
-    assert "returncode: 2" in log and "NVM" in log
-    assert "must-not-run" not in log
-
-
 def test_log_redacts_secrets_that_need_json_escaping(tmp_path: Path) -> None:
     secret = 'private"value\\end'
     path = ws.write_task_log(tmp_path, "secret", command=["tool", secret], stdout=secret, stderr="", returncode=0, secrets={secret})
     content = path.read_text()
     assert secret not in content
     assert json.dumps(secret)[1:-1] not in content
-
-
-def test_tty_plan_keeps_every_action_visible_before_confirmation(tmp_path: Path, monkeypatch) -> None:
-    plan = [{"kind": "package", "command": ["first-install"]}, {"kind": "installer", "command": ["second-install"]}]
-    monkeypatch.setattr(ws, "build_bootstrap_plan", lambda *args, **kwargs: plan)
-    frames = []
-    monkeypatch.setattr(ws.Progress, "_render_tty", lambda self: frames.append(dict(self.rows)))
-    assert ws.run_bootstrap(tmp_path, "default", yes=False, argv=["bootstrap"], input_fn=lambda prompt: "n", progress_mode="tty") == 1
-    planned = [detail for status, detail in frames[-1].values() if status == "planned"]
-    assert any("first-install" in detail for detail in planned)
-    assert any("second-install" in detail for detail in planned)
-
-
-def test_quiet_plan_is_visible_before_confirmation_and_execution_stays_quiet(tmp_path: Path, monkeypatch, capsys) -> None:
-    secret = "head'tail"
-    plan = [{"kind": "package", "command": ["first-install", secret]}, {"kind": "installer", "command": ["second-install"]}]
-    monkeypatch.setattr(ws, "build_bootstrap_plan", lambda *args, **kwargs: plan)
-
-    def confirm(prompt):
-        output = capsys.readouterr().out
-        assert "first-install" in output and "second-install" in output
-        assert "head" not in output and "tail" not in output
-        assert "***" in output and "[y/N]" in prompt
-        return "y"
-
-    assert ws.run_bootstrap(
-        tmp_path, "default", yes=False, argv=["bootstrap"], progress_mode="quiet",
-        environ={"TEST_TOKEN": secret}, input_fn=confirm,
-        runner=lambda command, **kwargs: CompletedProcess(command, 0, "detail", ""),
-    ) == 0
-    output = capsys.readouterr().out
-    assert len(output.splitlines()) == 1 and "summary" in output
 
 
 @pytest.mark.parametrize("phase", ["repository_jobs", "project_setup_jobs"])
@@ -999,20 +801,6 @@ def test_bootstrap_propagates_first_completed_failure_not_job_order(tmp_path: Pa
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert "exit code 7" in events[-1]["detail"]
     assert any(event["task"] == "skipped" and event["status"] == "skipped" for event in events)
-
-
-def test_sudo_plan_is_executed_once_without_authentication_rewriting(tmp_path: Path) -> None:
-    plan = [{"kind": "package", "command": ["sudo", "apt-get", "install", "-y", "git"]}]
-    lines = []
-    commands = []
-    ws.render_plan(plan, lines.append)
-    results = asyncio.run(ws.run_tool_actions(
-        plan, ws.Progress("quiet", log_dir=tmp_path / "logs"), root=tmp_path,
-        command_runner=lambda command, **kwargs: commands.append(command) or CompletedProcess(command, 0),
-    ))
-    assert lines == ["$ sudo apt-get install -y git"]
-    assert commands == [["sudo", "apt-get", "install", "-y", "git"]]
-    assert len(results) == 1 and results[0].returncode == 0
 
 
 def test_default_setup_uses_project_owned_commands() -> None:
@@ -1188,7 +976,7 @@ def test_bootstrap_revalidates_changed_local_settings_before_prerequisites(tmp_p
     calls = []
     plan = {
         "root": tmp_path, "configuration": action, "settings": settings,
-        "tool_actions": [{"kind": "package", "command": ["must-not-run"]}],
+        "tool_actions": [{"kind": "manual", "tool": "git", "blocking": True}],
         "command_runner": lambda command, **kwargs: calls.append(command) or CompletedProcess(command, 0),
     }
     with pytest.raises(ValueError, match="configuration changed after confirmation"):

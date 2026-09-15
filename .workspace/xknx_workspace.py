@@ -81,6 +81,7 @@ TOOL_LINKS = {
     "git": "https://git-scm.com/downloads",
     "uv": "https://docs.astral.sh/uv/getting-started/installation/",
     "tmux": "https://github.com/tmux/tmux/wiki/Installing",
+    "nvm": "https://github.com/nvm-sh/nvm#installing-and-updating",
 }
 
 PACKAGE_SOURCE_LINKS = {
@@ -96,7 +97,6 @@ MINIMUM_TOOL_VERSIONS = {"git": "2.39.0", "uv": "0.8.17", "tmux": "3.2"}
 DIAGNOSTIC_TIMEOUT = 5
 DOCS_URLS = {"xknx-docs": "http://127.0.0.1:4001/", "ha-docs": "http://127.0.0.1:4000/"}
 REAL_KNX_NOTE = "Secure material is a validated local reference only; configure the KNX integration in Home Assistant explicitly. The workspace does not generate or overwrite that integration configuration."
-NVM_RELEASE_API = "https://api.github.com/repos/nvm-sh/nvm/releases/latest"
 TMUX_SESSION = "xknx-dev"
 TMUX_TARGET = f"={TMUX_SESSION}"
 TMUX_STATUS_FORMAT = "#{window_name}\t#{pane_dead}\t#{pane_current_command}\t#{pane_dead_status}\t#{pane_start_command}\t#{pane_current_path}\t#{@xknx-ha-active}"
@@ -421,50 +421,25 @@ def repository_jobs(root: Path, repositories: Mapping[str, str]) -> list[Job]:
     ]
 
 
-async def run_tool_actions(actions, progress: Progress, *, root: Path = ROOT, command_runner=None) -> list[Result]:
+async def run_tool_actions(actions, progress: Progress) -> list[Result]:
     results = []
     failed = False
     for index, item in enumerate(actions):
         name = f"tool-{item.get('tool', index)}"
-        if item.get("kind") == "tool" and item.get("blocking"):
-            progress.emit(name, "error", f"Requires {item['tool']} >= {item['minimum']}; installed {item.get('installed') or 'unavailable'}. Update it explicitly: {TOOL_LINKS[item['tool']]}")
-            results.append(Result(name, 2, 0))
-            failed = True
-            continue
-        manual = item.get("kind") == "manual" and "scope" not in item
-        if not manual and (item.get("kind") not in {"package", "installer", "controller"} or not item.get("command")):
+        if not item.get("blocking") or item.get("scope") == "docs":
             continue
         if failed:
             results.append(Result(name, 1, 0, "skipped"))
             progress.emit(name, "skipped", "An earlier prerequisite failed")
             continue
-        if manual:
-            progress.emit(name, "error", f"Install {item['tool']}: {item.get('link', '')}")
-            results.append(Result(name, 2, 0))
-            failed = True
-            continue
-
-        def verify():
-            if item.get("kind") == "package" and (package := _package_parts(item["command"])):
-                for name in sorted(package[1] & MINIMUM_TOOL_VERSIONS.keys()):
-                    state = inspect_tool(name)
-                    progress.versions = {**progress.versions, name: state["installed"]}
-                    if state["installed"] is None or _version_tuple(state["installed"]) < _version_tuple(MINIMUM_TOOL_VERSIONS[name]):
-                        return f"Requires {name} >= {MINIMUM_TOOL_VERSIONS[name]}; package-source install did not provide a compatible version"
-            if item.get("kind") == "installer" and item.get("tool") == "nvm":
-                installed = inspect_tool("nvm")["installed"]
-                progress.versions = {**progress.versions, "nvm": installed}
-                if not isinstance(installed, str) or (item.get("version") and installed != item["version"]):
-                    return "Installed NVM version could not be verified"
-            return None
-
-        result = await run_job(
-            Job(name, root, (item["command"],)), progress,
-            command_runner=command_runner, verify=verify,
-            env={name: value for name, value in os.environ.items() if name not in {"UV_PROJECT_ENVIRONMENT", "VIRTUAL_ENV"}},
-        )
-        results.append(result)
-        failed = result.returncode != 0
+        tools = item.get("tools") or (item.get("tool"),)
+        if item.get("kind") == "tool":
+            detail = f"Requires {item['tool']} >= {item['minimum']}; installed {item.get('installed') or 'unavailable'}. Update it explicitly: {TOOL_LINKS[item['tool']]}"
+        else:
+            detail = f"Install {', '.join(tools)}: {display_command(item['command'])}" if item.get("command") else f"Install {', '.join(tools)}: {item.get('link', '')}"
+        progress.emit(name, "error", detail)
+        results.append(Result(name, 2, 0))
+        failed = True
     return results
 
 
@@ -476,9 +451,7 @@ async def bootstrap_workspace(plan: dict[str, object], progress: Progress) -> in
         configuration = plan.get("configuration")
         if configuration and configuration_action(plan["root"], plan["settings"]) != configuration:
             raise ValueError("home_assistant configuration changed after confirmation; review bootstrap again")
-        results = await run_tool_actions(
-            plan.get("tool_actions", ()), progress, root=plan["root"], command_runner=plan.get("command_runner")
-        )
+        results = await run_tool_actions(plan.get("tool_actions", ()), progress)
         if not all(result.returncode == 0 for result in results):
             code = next(result.returncode for result in results if result.returncode != 0)
             return code
@@ -581,7 +554,7 @@ def version_decision(tool: str, installed: str | None, expected: str, enforce: b
     }
 
 
-def missing_tool_actions(
+def prerequisite_guidance(
     platform: str,
     tools: Mapping[str, str | None],
     apt_packages: set[str] | None = None,
@@ -592,7 +565,7 @@ def missing_tool_actions(
         return []
     if not package_source_available:
         tool, link = PACKAGE_SOURCE_LINKS[platform]
-        return [{"kind": "manual", "tool": tool, "command": [], "link": link}]
+        return [{"kind": "manual", "blocking": True, "tools": tuple(missing), "command": [], "link": link}]
     available = missing
     if platform != "macos":
         if apt_packages is None:
@@ -609,44 +582,13 @@ def missing_tool_actions(
         available = [name for name in missing if name in apt_packages]
     actions: list[dict[str, object]] = []
     if available:
-        actions.append({"kind": "package", "command": PACKAGE_COMMANDS[platform](available)})
+        actions.append({"kind": "manual", "blocking": True, "tools": tuple(available), "command": PACKAGE_COMMANDS[platform](available)})
     actions.extend(
-        {"kind": "manual", "tool": name, "command": [], "link": TOOL_LINKS[name]}
+        {"kind": "manual", "blocking": True, "tool": name, "command": [], "link": TOOL_LINKS[name]}
         for name in missing
         if name not in available
     )
     return actions
-
-
-def nvm_install_action(tag: str) -> dict[str, object]:
-    if not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
-        raise ValueError(f"invalid NVM release: {tag}")
-    return {
-        "tool": "nvm",
-        "version": tag[1:],
-        "command": [
-            "sh",
-            "-c",
-            'tmp=$(mktemp) && trap \'rm -f "$tmp"\' EXIT && '
-            "curl -fsS --location --max-redirs 0 --proto '=https' "
-            f'-o "$tmp" https://raw.githubusercontent.com/nvm-sh/nvm/{tag}/install.sh && '
-            'PROFILE=/dev/null bash "$tmp"',
-        ],
-    }
-
-
-def resolve_nvm_release(opener=urllib.request.urlopen) -> str:
-    request = urllib.request.Request(
-        NVM_RELEASE_API,
-        headers={"Accept": "application/vnd.github+json"},
-    )
-    with opener(request, timeout=10) as response:
-        if response.geturl() != NVM_RELEASE_API:
-            raise ValueError(f"redirected NVM release API: {response.geturl()}")
-        tag = json.loads(response.read())["tag_name"]
-    if not isinstance(tag, str) or not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
-        raise ValueError(f"invalid NVM release: {tag}")
-    return tag
 
 
 def nvm_shell(command: list[str]) -> list[str]:
@@ -1232,7 +1174,16 @@ def inspect_tool(name: str, expectation: str | None = None, *, cwd: Path | None 
     if expectation or minimum:
         status.update(version_decision(name, installed, expectation or minimum, enforce=False))
     if minimum:
-        status.update(minimum=minimum, blocking=executable is not None and (installed is None or _version_tuple(installed) < _version_tuple(minimum)))
+        status.update(
+            minimum=minimum,
+            blocking=(
+                executable is None
+                or installed is None
+                or _version_tuple(installed) < _version_tuple(minimum)
+            ),
+        )
+    if name == "nvm":
+        status.update(blocking=executable is None or installed is None, link=TOOL_LINKS[name])
     return status
 
 
@@ -1440,8 +1391,6 @@ def build_bootstrap_plan(
     root: Path,
     profile: str,
     settings: dict[str, object],
-    *,
-    enforce_tool_versions: bool = False,
 ) -> list[dict[str, object]]:
     validate_settings_schema(settings)
     repositories = repositories_for(profile)
@@ -1455,13 +1404,12 @@ def build_bootstrap_plan(
             "profile": profile,
             "repositories": repositories,
             "settings": settings,
-            "enforce_tool_versions": enforce_tool_versions,
         }
     ]
     tool_states = [inspect_tool(name) for name in ("git", "uv", "tmux")]
     plan.extend(tool_states)
     plan.extend(
-        missing_tool_actions(
+        prerequisite_guidance(
             platform,
             {str(item["tool"]): item["executable"] for item in tool_states},
             package_source_available=package_source_available(platform),
@@ -1469,21 +1417,9 @@ def build_bootstrap_plan(
     )
     if NODE_REPOSITORIES.intersection(repositories):
         nvm = inspect_tool("nvm")
-        plan.append(nvm)
-        if nvm["executable"] is None or enforce_tool_versions:
-            tag = resolve_nvm_release()
-            decision = version_decision(
-                "nvm", nvm["installed"] if isinstance(nvm["installed"], str) else None, tag, enforce_tool_versions
-            )
-            if decision["action"] in {"install", "replace"}:
-                plan.append({"kind": "installer", **nvm_install_action(tag), "decision": decision})
+        plan.append({**nvm, "blocking": nvm["executable"] is None or nvm["installed"] is None, "link": TOOL_LINKS["nvm"]})
     plan.append(inspect_docker(platform))
     plan.extend(docs_prerequisite_actions(root, profile))
-    if not (root / ".workspace/.venv/bin/python").is_file():
-        plan.append({
-            "kind": "controller", "tool": "workspace-cli",
-            "command": ["uv", "sync", "--project", str(root / ".workspace"), "--locked", "--no-dev", "--no-python-downloads", "--python", sys.executable],
-        })
     configuration = configuration_action(root, settings)
     plan.append(configuration)
     plan.extend(
@@ -1496,15 +1432,6 @@ def build_bootstrap_plan(
     plan.append({"kind": "smoke", "command": home_assistant_import_command(root)})
     plan.append({"kind": "smoke", "command": home_assistant_command(root, {**DEFAULTS["home_assistant"], **settings.get("home_assistant", {})}), "lifecycle": "temporary foreground Home Assistant; wait for HTTP, then terminate and reap before bootstrap returns; reuse an existing tmux Home Assistant pane"})
     return plan
-
-
-def _package_parts(command: object) -> tuple[tuple[str, ...], set[str]] | None:
-    if not isinstance(command, list):
-        return None
-    for prefix in (("brew", "install"), ("sudo", "apt-get", "install", "-y")):
-        if tuple(command[: len(prefix)]) == prefix:
-            return prefix, set(command[len(prefix) :])
-    return None
 
 
 def render_plan(plan: Sequence[Mapping[str, object]], print_fn=print, *, secrets: set[str] | None = None) -> None:
@@ -1544,7 +1471,6 @@ def run_bootstrap(
     *,
     yes: bool,
     argv: Sequence[str],
-    enforce_tool_versions: bool = False,
     jobs: int = 3,
     progress_mode: str = "auto",
     verbose: bool = False,
@@ -1555,7 +1481,7 @@ def run_bootstrap(
     if jobs < 1:
         raise ValueError("jobs must be positive")
     settings = load_settings(root, environ)
-    plan = build_bootstrap_plan(root, profile, settings, enforce_tool_versions=enforce_tool_versions)
+    plan = build_bootstrap_plan(root, profile, settings)
 
     progress = Progress(
         progress_mode, log_dir=root / ".state/logs", secrets=secret_values(environ), verbose=verbose,
@@ -1911,7 +1837,6 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap.add_argument("--jobs", type=int, default=3)
     bootstrap.add_argument("--progress", choices=("auto", "tty", "plain", "json", "quiet"), default="auto")
     bootstrap.add_argument("--verbose", action="store_true")
-    bootstrap.add_argument("--enforce-tool-versions", action="store_true")
 
     dev = commands.add_parser("dev")
     dev_commands = dev.add_subparsers(dest="dev_command", required=True)
@@ -1950,7 +1875,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.profile,
                 yes=args.yes,
                 argv=argv,
-                enforce_tool_versions=args.enforce_tool_versions,
                 jobs=args.jobs,
                 progress_mode=args.progress,
                 verbose=args.verbose,

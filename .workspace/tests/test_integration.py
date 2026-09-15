@@ -2,8 +2,6 @@ import asyncio
 import hashlib
 import json
 import os
-import pty
-import select
 import shlex
 import signal
 import socket
@@ -269,41 +267,6 @@ def test_hanging_docker_is_bounded_in_the_complete_bootstrap_plan(tmp_path: Path
     docker = next(item for item in plan if item.get("tool") == "docker")
     assert docker["level"] == "info" and docker["available"] is False
     assert any(item.get("kind") == "setup" for item in plan)
-
-
-def test_missing_controller_environment_is_planned_confirmed_and_created_locally(tmp_path: Path, monkeypatch, capsys) -> None:
-    fake_planning_tools(monkeypatch)
-    executable = tmp_path / "uv"
-    executable.write_text(
-        f"#!{sys.executable}\nimport os, pathlib, sys\n"
-        "assert 'UV_PROJECT_ENVIRONMENT' not in os.environ and 'VIRTUAL_ENV' not in os.environ\n"
-        "assert sys.argv[1] == 'sync' and '--locked' in sys.argv and '--no-python-downloads' in sys.argv\n"
-        "project = pathlib.Path(sys.argv[sys.argv.index('--project') + 1])\n"
-        "interpreter = project / '.venv/bin/python'\ninterpreter.parent.mkdir(parents=True)\ninterpreter.touch()\n"
-    )
-    executable.chmod(0o755)
-    monkeypatch.setenv("PATH", str(tmp_path))
-    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", str(tmp_path / "unrelated"))
-    monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / "unrelated"))
-    build = ws.build_bootstrap_plan
-    actions = build(tmp_path, "default", ws.load_settings(tmp_path, {}))
-    controller = [item for item in actions if item.get("kind") == "controller"]
-    assert len(controller) == 1
-    command = controller[0]["command"]
-    assert command[command.index("--project") + 1] == str(tmp_path / ".workspace")
-    assert command[command.index("--python") + 1] == sys.executable
-    monkeypatch.setattr(ws, "build_bootstrap_plan", lambda *args, **kwargs: controller)
-    prompts = []
-    def confirm(prompt):
-        prompts.append(prompt)
-        output = capsys.readouterr().out
-        assert "uv sync" in output and "--locked" in output and ".workspace" in output
-        assert not (tmp_path / ".workspace").exists()
-        return "y"
-    assert ws.run_bootstrap(tmp_path, "default", yes=False, argv=["bootstrap"], input_fn=confirm, progress_mode="plain") == 0
-    assert len(prompts) == 1 and (tmp_path / ".workspace/.venv/bin/python").is_file()
-    assert not (tmp_path / "unrelated").exists()
-    assert not any(item.get("kind") == "controller" for item in build(tmp_path, "default", ws.load_settings(tmp_path, {})))
 
 
 def test_bootstrap_private_repository_propagates_exact_git_failure(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -760,27 +723,6 @@ def test_repository_jobs_reuse_safe_git_updates_and_log_decisions(tmp_path: Path
     assert "unchanged" in next((tmp_path / "logs").glob("*.log")).read_text()
 
 
-def test_bootstrap_runs_prerequisites_before_local_repository_jobs_with_json_output(tmp_path: Path, monkeypatch, capsys) -> None:
-    origin, _, _ = create_checkout(tmp_path)
-    root = tmp_path / "workspace"
-    root.mkdir()
-    plan = [
-        {"kind": "context", "platform": "macos", "profile": "default", "repositories": ["xknx"], "settings": {}},
-        {"kind": "package", "command": [sys.executable, "-c", "from pathlib import Path; Path('prerequisite.done').touch(); print('ready')"]},
-    ]
-    monkeypatch.setattr(ws, "build_bootstrap_plan", lambda *args, **kwargs: plan)
-    monkeypatch.setitem(ws.REPOSITORIES, "xknx", str(origin))
-    assert ws.run_bootstrap(root, "default", yes=True, argv=["bootstrap", "--yes"], progress_mode="json") == 0
-    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    tool_done = next(index for index, event in enumerate(events) if event["task"] == "tool-1" and event["status"] == "success")
-    repository_start = next(index for index, event in enumerate(events) if event["task"] == "xknx" and event["status"] == "running")
-    assert tool_done < repository_start
-    assert events[-1]["status"] == "summary" and "exit code 0" in events[-1]["detail"]
-    assert (root / "prerequisite.done").exists()
-    assert (root / "xknx/.git").exists()
-    assert len(list((root / ".state/logs").glob("*.log"))) == 2
-
-
 def process_is_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -814,126 +756,6 @@ def test_cancellation_reaps_fast_and_sigint_ignoring_children(tmp_path: Path) ->
             await asyncio.sleep(0.05)
 
     asyncio.run(exercise())
-
-
-@pytest.mark.parametrize("mode", ["zero-timeout", "nopasswd", "ctrl-c", "auth-ctrl-c"])
-def test_sudo_authentication_preserves_terminal_and_ctrl_c_reaps_package_work(tmp_path: Path, mode: str) -> None:
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    sudo = bin_dir / "sudo"
-    package_work = (
-        "import os, pathlib, signal, sys, time\n"
-        "assert os.isatty(0) and os.tcgetpgrp(0) == os.getpgrp()\n"
-        "signal.signal(signal.SIGINT, lambda *args: pathlib.Path('ignored-sigint').touch())\n"
-        "def terminate(*args):\n"
-        "    pathlib.Path('terminated').touch()\n"
-        "    sys.exit(0)\n"
-        "signal.signal(signal.SIGTERM, terminate)\n"
-        "pathlib.Path('package.pid').write_text(str(os.getpid()))\n"
-        "if os.environ['TASK4_TEST_MODE'] == 'ctrl-c': time.sleep(30)\n"
-    )
-    sudo.write_text(
-        f"#!{sys.executable}\n"
-        "import json, os, pathlib, sys\n"
-        "args = sys.argv[1:]\n"
-        "mode = os.environ['TASK4_TEST_MODE']\n"
-        "with open('sudo-commands', 'a') as out: out.write(json.dumps(args) + '\\n')\n"
-        "if args == ['-v'] and mode == 'nopasswd': sys.exit(11)\n"
-        "if args[0] == '-n': sys.exit(12)\n"
-        "assert args in (['-v'], ['apt-get', 'install', '-y', 'git'])\n"
-        "if mode != 'nopasswd':\n"
-        "    pathlib.Path('auth.pid').write_text(str(os.getpid()))\n"
-        "    tty = os.open('/dev/tty', os.O_RDWR)\n"
-        "    assert os.tcgetpgrp(tty) == os.getpgrp()\n"
-        "    os.write(tty, b'AUTH PASSWORD\\n')\n"
-        "    assert os.read(tty, 100).strip() == b'answer'\n"
-        "if args == ['-v']: sys.exit(0)\n"
-        f"os.execv(sys.executable, [sys.executable, '-c', {package_work!r}])\n"
-    )
-    sudo.chmod(0o755)
-    controller = (
-        "import os, pathlib, sys\n"
-        f"sys.path.insert(0, {str(Path(ws.__file__).parent)!r})\n"
-        "import xknx_workspace as ws\n"
-        f"root = pathlib.Path({str(tmp_path)!r})\n"
-        f"os.environ['PATH'] = {str(bin_dir)!r} + os.pathsep + os.environ['PATH']\n"
-        f"os.environ['TASK4_TEST_MODE'] = {mode!r}\n"
-        "ws.build_bootstrap_plan = lambda *args, **kwargs: [{'kind': 'package', 'command': ['sudo', 'apt-get', 'install', '-y', 'git']}]\n"
-        "code = ws.run_bootstrap(root, 'default', yes=False, argv=['bootstrap'], progress_mode='quiet')\n"
-        f"assert code == {0 if mode in {'zero-timeout', 'nopasswd'} else 130}\n"
-        "assert os.tcgetpgrp(0) == os.getpgrp()\n"
-        "for path in root.glob('*.pid'):\n"
-        "    try: os.kill(int(path.read_text()), 0)\n"
-        "    except ProcessLookupError: pass\n"
-        "    else: raise AssertionError('test child survived bootstrap')\n"
-        "assert input('TERMINAL READY\\n') == 'done'\n"
-    )
-    pid, terminal = pty.fork()
-    if pid == 0:
-        os.execv(sys.executable, [sys.executable, "-c", controller])
-    output = b""
-    confirmed = False
-    answered = False
-    interrupted = False
-    usable = False
-    reaped = False
-    try:
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            if mode == "ctrl-c" and not interrupted and (tmp_path / "package.pid").exists():
-                os.write(terminal, b"\x03")
-                interrupted = True
-            if select.select([terminal], [], [], 0.05)[0]:
-                try:
-                    chunk = os.read(terminal, 65536)
-                except OSError:
-                    break
-                if not chunk:
-                    break
-                output += chunk
-                if b"Execute this plan?" in output and not confirmed:
-                    os.write(terminal, b"y\n")
-                    confirmed = True
-                if b"AUTH PASSWORD\r\n" in output and not answered:
-                    os.write(terminal, b"\x03" if mode == "auth-ctrl-c" else b"answer\n")
-                    answered = True
-                if b"TERMINAL READY\r\n" in output and not usable:
-                    os.write(terminal, b"done\n")
-                    usable = True
-            finished, status = os.waitpid(pid, os.WNOHANG)
-            if finished:
-                reaped = True
-                break
-        if not reaped:
-            while time.monotonic() < deadline:
-                finished, status = os.waitpid(pid, os.WNOHANG)
-                if finished:
-                    reaped = True
-                    break
-                time.sleep(0.01)
-        assert reaped and os.waitstatus_to_exitcode(status) == 0, output.decode(errors="replace")
-        assert confirmed and usable
-        assert answered == (mode != "nopasswd")
-        assert b"sudo apt-get install -y git" in output
-        assert b"sudo -v" not in output and b"sudo -n" not in output
-        commands = [json.loads(line) for line in (tmp_path / "sudo-commands").read_text().splitlines()]
-        assert commands == [["apt-get", "install", "-y", "git"]]
-        log = next((tmp_path / ".state/logs").glob("*.log")).read_text()
-        assert 'argv: [["sudo", "apt-get", "install", "-y", "git"]]' in log
-        if mode == "auth-ctrl-c":
-            assert not (tmp_path / "package.pid").exists()
-        if mode == "ctrl-c":
-            assert (tmp_path / "ignored-sigint").exists()
-            assert (tmp_path / "terminated").exists()
-            assert "returncode: 130" in log
-    finally:
-        if not reaped:
-            os.kill(pid, signal.SIGKILL)
-            os.waitpid(pid, 0)
-        for child_pid in tmp_path.glob("*.pid"):
-            if process_is_alive(int(child_pid.read_text())):
-                os.kill(int(child_pid.read_text()), signal.SIGKILL)
-        os.close(terminal)
 
 
 def test_quoted_secrets_are_redacted_from_job_and_private_repository_output(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -1120,11 +942,6 @@ def test_confirmed_bootstrap_creates_config_sets_up_then_checks_imports(tmp_path
     uv = bin_dir / "uv"
     uv.write_text(
         f"#!{sys.executable}\nimport pathlib, sys\n"
-        "if sys.argv[1] == 'sync':\n"
-        "    assert not pathlib.Path('.xknx-dev.toml').exists()\n"
-        "    interpreter = pathlib.Path('.workspace/.venv/bin/python')\n"
-        "    interpreter.parent.mkdir(parents=True)\n    interpreter.touch()\n    raise SystemExit(0)\n"
-        "assert pathlib.Path('.workspace/.venv/bin/python').exists()\n"
         "assert pathlib.Path('home-assistant-core/setup.done').exists()\n"
         "pathlib.Path('wiring.done').touch()\n"
     )
@@ -1142,7 +959,7 @@ def test_confirmed_bootstrap_creates_config_sets_up_then_checks_imports(tmp_path
     monkeypatch.setattr(ws, "tmux_status", lambda: {"session": "xknx-dev", "running": False, "windows": []})
     assert ws.run_bootstrap(tmp_path, "default", yes=True, argv=["bootstrap", "--yes"], environ={"XKNX_HA_PORT": str(port)}, progress_mode="quiet") == (1 if outside_import else 0)
     assert (tmp_path / "wiring.done").exists()
-    assert len(list((tmp_path / ".state/logs").glob("*.log"))) == (3 if outside_import else 4)
+    assert len(list((tmp_path / ".state/logs").glob("*.log"))) == (2 if outside_import else 3)
 
 
 @pytest.mark.parametrize("with_yaml", [False, True])
