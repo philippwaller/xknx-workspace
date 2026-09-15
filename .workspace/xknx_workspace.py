@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import codecs
+import errno
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -229,7 +231,7 @@ async def _stop_process(process, completion, *, group: bool = True) -> None:
     await completion
 
 
-async def run_job(job: Job, progress: Progress, *, command_runner=None, verify=None) -> Result:
+async def run_job(job: Job, progress: Progress, *, command_runner=None, verify=None, env=None) -> Result:
     start, clock_start = datetime.now(timezone.utc), time.monotonic()
     # ponytail: buffer each task's output; spool to disk if build logs exhaust memory.
     stdout: list[str] = []
@@ -259,7 +261,7 @@ async def run_job(job: Job, progress: Progress, *, command_runner=None, verify=N
             commands.append(command)
             progress.emit(job.name, "running", f"$ {display_command(command, progress.secrets)}")
             if command_runner is not None:
-                result = command_runner(command, cwd=job.cwd, capture_output=True, text=True, check=False)
+                result = command_runner(command, cwd=job.cwd, capture_output=True, text=True, check=False, **({"env": env} if env is not None else {}))
                 stdout.append(result.stdout or "")
                 stderr.append(result.stderr or "")
                 returncode = result.returncode
@@ -268,7 +270,7 @@ async def run_job(job: Job, progress: Progress, *, command_runner=None, verify=N
                 # Keep sudo with the controller for authentication and terminal Ctrl+C.
                 process = await asyncio.create_subprocess_exec(
                     *command, cwd=job.cwd, stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE, start_new_session=not sudo,
+                    stderr=asyncio.subprocess.PIPE, start_new_session=not sudo, env=env,
                 )
                 completion = asyncio.gather(
                     read_output(process.stdout, stdout), read_output(process.stderr, stderr), process.wait()
@@ -408,6 +410,9 @@ async def bootstrap_workspace(plan: dict[str, object], progress: Progress) -> in
     pending_callbacks = {name for name in ("wire_home_assistant", "smoke_default") if plan.get(name)}
     code = 1
     try:
+        configuration = plan.get("configuration")
+        if configuration and configuration_action(plan["root"], plan["settings"]) != configuration:
+            raise ValueError("home_assistant configuration changed after confirmation; review bootstrap again")
         results = await run_tool_actions(
             plan.get("tool_actions", ()), progress, root=plan["root"], command_runner=plan.get("command_runner")
         )
@@ -420,14 +425,36 @@ async def bootstrap_workspace(plan: dict[str, object], progress: Progress) -> in
             pending_callbacks.clear()
             code = 0
             return code
+        if configuration:
+            create_local_configuration(configuration, plan["root"])
         pending = list(plan.get("project_setup_jobs", ()))
         results = await run_jobs(plan.get("repository_jobs", ()), plan.get("jobs", 3), progress)
         if not all(result.returncode == 0 for result in results):
             code = progress.first_returncode or 1
             return code
+        if configuration:
+            create_home_assistant_configuration(configuration)
+
+        async def setup_runner(job):
+            env = {name: value for name, value in os.environ.items() if name not in {"VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT"}}
+            return await run_job(job, progress, command_runner=plan.get("command_runner"), env=env)
+
+        blocked_docs = {}
+        if plan.get("profile") in {"docs", "all"}:
+            for action in docs_prerequisite_actions(plan["root"], plan["profile"]):
+                if action.get("blocking"):
+                    for repository in (action["repository"],) if action.get("repository") else ("xknx/docs", "home-assistant.io"):
+                        blocked_docs[(plan["root"] / repository).resolve()] = action
+        setup_jobs = []
+        for job in plan.get("project_setup_jobs", ()):
+            if action := blocked_docs.get(job.cwd.resolve()):
+                progress.emit(job.name, "skipped", f"Requires {action.get('tool', 'Ruby')} {action.get('expected', '')}: {action.get('link') or action.get('message', '')}")
+            else:
+                setup_jobs.append(job)
         pending = []
         results = await run_jobs(
-            plan.get("project_setup_jobs", ()), plan.get("jobs", 3), progress, expected=plan.get("expected_artifacts")
+            setup_jobs, plan.get("jobs", 3), progress,
+            expected=plan.get("expected_artifacts"), runner=setup_runner,
         )
         if not all(result.returncode == 0 for result in results):
             code = progress.first_returncode or 1
@@ -440,7 +467,7 @@ async def bootstrap_workspace(plan: dict[str, object], progress: Progress) -> in
             pending_callbacks.remove("smoke_default")
             if not await smoke(plan, progress):
                 return 1
-        code = 0
+        code = 2 if blocked_docs else 0
         return code
     except (asyncio.CancelledError, KeyboardInterrupt):
         code = 130
@@ -568,6 +595,198 @@ def nvm_shell(command: list[str]) -> list[str]:
         '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; '
         f"nvm install --silent && nvm use --silent && {quoted}",
     ]
+
+
+def project_setup_jobs(root: Path, profile: str, *, reuse_ha_config: bool = False) -> list[Job]:
+    root = root.resolve()
+    ha_commands = (["script/setup"],)
+    if reuse_ha_config or (root / "home-assistant-core/config").exists():
+        ha_commands = (["uv", "venv"], ["bash", "-c", ". .venv/bin/activate && script/bootstrap"])
+    elif (root / "home-assistant-core/.venv/bin/python").is_file():
+        ha_commands = (["bash", "-c", ". .venv/bin/activate && script/setup"],)
+    adapters = {
+        "home-assistant-core": ("Home Assistant Core", ha_commands),
+        "xknx": ("XKNX", (["uv", "sync", "--group", "dev", "--locked"],)),
+        "xknxproject": ("XKNX Project", (
+            ["uv", "venv"],
+            ["uv", "pip", "install", "--python", ".venv/bin/python", "-e", ".", "-r", "requirements_testing.txt"],
+        )),
+        "knx-telegram-store": ("KNX Telegram Store", (
+            ["uv", "venv"],
+            ["uv", "pip", "install", "--python", ".venv/bin/python", "-e", ".[dev,sqlite,postgres]"],
+        )),
+        "knx-frontend": ("KNX Frontend", (nvm_shell(["script/bootstrap"]),)),
+        "home-assistant-frontend": ("Home Assistant Frontend", (nvm_shell(["script/setup"]),)),
+        "xknxtoolkit": ("XKNX Toolkit", (["uv", "sync"],)),
+        "home-assistant.io": ("Home Assistant Docs", (["bundle", "install"], nvm_shell(["npm", "ci"]))),
+    }
+    jobs = []
+    for repository in repositories_for(profile):
+        name, commands = adapters[repository]
+        if commands[0] == ["uv", "venv"] and (root / repository / ".venv/bin/python").is_file():
+            commands = commands[1:]
+        jobs.append(Job(name, root / repository, commands))
+    if profile in {"docs", "all"}:
+        jobs.append(Job("XKNX Docs", root.resolve() / "xknx/docs", (["bundle", "install"],)))
+    return jobs
+
+
+def project_development_jobs(root: Path, profile: str) -> list[Job]:
+    adapters = {
+        "knx-frontend": ("knx-frontend", nvm_shell(["script/develop"])),
+        "home-assistant-frontend": ("home-assistant-frontend", nvm_shell(["script/develop"])),
+        "xknxtoolkit": ("toolkit", ["uv", "run", "python", "-m", "knx_gui.main"]),
+        "home-assistant.io": ("ha-docs", ["bundle", "exec", "rake", "preview"]),
+    }
+    jobs = [
+        Job(adapters[name][0], root.resolve() / name, (adapters[name][1],))
+        for name in repositories_for(profile) if name in adapters
+    ]
+    if profile in {"docs", "all"}:
+        jobs.append(Job("xknx-docs", root.resolve() / "xknx/docs", (["bundle", "exec", "jekyll", "serve"],)))
+    return jobs
+
+
+def home_assistant_wiring_command(root: Path) -> list[str]:
+    root = root.resolve()
+    return [
+        "uv", "pip", "install", "--python", str(root / "home-assistant-core/.venv/bin/python"),
+        "-e", str(root / "xknx"), "-e", str(root / "xknxproject"),
+        "-e", f"{root / 'knx-telegram-store'}[sqlite,postgres]", "-e", str(root / "knx-frontend"),
+    ]
+
+
+def home_assistant_command(root: Path, settings: Mapping[str, object]) -> list[str]:
+    root = root.resolve()
+    return [
+        str(root / "home-assistant-core/.venv/bin/python"), "-m", "homeassistant",
+        "--config", str((root / str(settings["config_dir"])).resolve()),
+        "--skip-pip-packages", "xknx,xknxproject,knx-frontend,knx-telegram-store",
+    ]
+
+
+def configuration_action(root: Path, settings: Mapping[str, object]) -> dict[str, object]:
+    root = root.resolve()
+    ha = {**DEFAULTS["home_assistant"], **settings.get("home_assistant", {})}
+    knx = {**DEFAULTS["knx"], **settings.get("knx", {})}
+    if set(ha) - {"port", "config_dir"}:
+        raise ValueError("home_assistant accepts only port and config_dir; move secret material to a local file")
+    if set(knx) - {"mode", "secure_config_path"}:
+        raise ValueError("knx accepts only mode and secure_config_path; move secret material to a local file")
+    if not isinstance(knx["mode"], str) or knx["mode"] not in {"automatic", "real"}:
+        raise ValueError("knx.mode / XKNX_KNX_MODE must be automatic or real")
+    secure = knx.get("secure_config_path")
+    if knx["mode"] == "real" or secure is not None:
+        if not isinstance(secure, str) or not secure:
+            raise ValueError("knx.secure_config_path must reference a readable local file for real KNX mode")
+        secure = (root / secure).resolve()
+        if not secure.is_file() or not os.access(secure, os.R_OK):
+            raise ValueError("knx.secure_config_path must reference a readable local file")
+    port = ha["port"]
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError("home_assistant.port / XKNX_HA_PORT must be an integer in 1..65535")
+    for family, host in ((socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")):
+        try:
+            with socket.socket(family) as probe:
+                probe.bind((host, port))
+        except OSError as error:
+            if family == socket.AF_INET6 and error.errno in {errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL, errno.EPROTONOSUPPORT}:
+                continue
+            raise ValueError(f"home_assistant.port {port} is unavailable; set XKNX_HA_PORT to a free port") from error
+    raw_path = ha["config_dir"]
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError("home_assistant.config_dir / XKNX_HA_CONFIG_DIR must be a directory path")
+    config_dir = (root / raw_path).resolve()
+    if not Path(raw_path).is_absolute() and not config_dir.is_relative_to(root):
+        raise ValueError("home_assistant.config_dir must stay inside the workspace; select an explicit absolute path with XKNX_HA_CONFIG_DIR")
+    ancestor = next(path for path in (config_dir, *config_dir.parents) if path.exists())
+    if not ancestor.is_dir() or not os.access(ancestor, os.W_OK | os.X_OK):
+        raise ValueError("home_assistant.config_dir / XKNX_HA_CONFIG_DIR must be writable")
+    local = root / ".xknx-dev.toml"
+    if local.is_symlink() or (local.exists() and not local.is_file()):
+        raise ValueError(".xknx-dev.toml must be a regular root-local file")
+    return {
+        "kind": "configuration", "path": str(local), "action": "reuse" if local.exists() else "create",
+        "sha256": hashlib.sha256(local.read_bytes()).hexdigest() if local.exists() else None,
+        "config_dir": str(config_dir), "reuse_config": config_dir.exists(),
+        "explicit_config": Path(raw_path).is_absolute() or raw_path != DEFAULTS["home_assistant"]["config_dir"],
+        "port": port, "knx_mode": knx["mode"], "secure_config_path": str(secure) if secure else None,
+    }
+
+
+def create_local_configuration(action: Mapping[str, object], root: Path) -> None:
+    if action["action"] == "create":
+        content = (root / ".xknx-dev.example.toml").read_text()
+        with Path(action["path"]).open("x") as config:
+            config.write(content)
+
+
+def create_home_assistant_configuration(action: Mapping[str, object]) -> None:
+    if action["reuse_config"]:
+        return
+    directory = Path(action["config_dir"])
+    if directory.resolve() != directory:
+        raise ValueError("home_assistant.config_dir changed after confirmation; review bootstrap again")
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "configuration.yaml"
+    if not path.exists():
+        with path.open("x") as config:
+            config.write(f"default_config:\nhttp:\n  server_port: {action['port']}\n")
+
+
+LOCAL_PACKAGES = {
+    "xknx": "xknx", "xknxproject": "xknxproject",
+    "knx_frontend": "knx-frontend", "knx_telegram_store": "knx-telegram-store",
+}
+
+
+def home_assistant_import_command(root: Path) -> list[str]:
+    root = root.resolve()
+    script = (
+        "import json, sys\nfrom pathlib import Path\n"
+        "import knx_frontend, knx_telegram_store, xknx, xknxproject\n"
+        "modules = (knx_frontend, knx_telegram_store, xknx, xknxproject)\n"
+        "paths = {module.__name__: str(Path(module.__file__).resolve()) for module in modules}\n"
+        "print(json.dumps(paths, indent=2), flush=True)\n"
+        f"repositories = {LOCAL_PACKAGES!r}\n"
+        "root = Path(sys.argv[1]).resolve()\n"
+        "invalid = [name for name, path in paths.items() if not Path(path).is_relative_to((root / repositories[name]).resolve())]\n"
+        "if invalid:\n    sys.exit('Imports outside root checkout: ' + ', '.join(invalid))\n"
+    )
+    return [str(root / "home-assistant-core/.venv/bin/python"), "-I", "-B", "-c", script, str(root)]
+
+
+def package_status(root: Path, runner=subprocess.run) -> dict[str, dict[str, object]]:
+    paths, error = {}, None
+    try:
+        result = runner(home_assistant_import_command(root), cwd=root, capture_output=True, text=True, check=False, timeout=30)
+        paths = json.loads(result.stdout)
+        if not isinstance(paths, dict):
+            raise ValueError("expected a JSON object")
+        if result.returncode:
+            error = f"Home Assistant import check exited {result.returncode}"
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        error = "Home Assistant imports unavailable; run bootstrap to set up and wire local packages"
+    status = {}
+    for module, repository in LOCAL_PACKAGES.items():
+        expected = (root / repository).resolve()
+        value = paths.get(module) if isinstance(paths, dict) else None
+        path = Path(value).resolve() if isinstance(value, str) and Path(value).is_absolute() else None
+        local = bool(path and path.is_relative_to(expected) and path.is_file())
+        status[module] = {
+            "path": str(path) if path else None, "expected": str(expected), "ok": local and error is None,
+            "error": ("Import must resolve below its root checkout" if path and not local else error or (None if local else "Import path missing")),
+        }
+    return status
+
+
+async def wire_home_assistant(plan: Mapping[str, object], progress: Progress) -> bool:
+    root = plan["root"]
+    result = await run_job(
+        Job("Home Assistant editable packages", root, (home_assistant_wiring_command(root), home_assistant_import_command(root))),
+        progress, command_runner=plan.get("command_runner"),
+    )
+    return result.returncode == 0
 
 
 def docker_status(platform: str, executable: str | None, daemon_reachable: bool) -> dict[str, object]:
@@ -737,6 +956,14 @@ def build_bootstrap_plan(
                 plan.append({"kind": "installer", **nvm_install_action(tag), "decision": decision})
     plan.append(inspect_docker(platform))
     plan.extend(docs_prerequisite_actions(root, profile))
+    configuration = configuration_action(root, settings)
+    plan.append(configuration)
+    plan.extend(
+        {"kind": "setup", "name": job.name, "cwd": str(job.cwd), "commands": job.commands}
+        for job in project_setup_jobs(root, profile, reuse_ha_config=configuration["reuse_config"])
+    )
+    plan.append({"kind": "wiring", "command": home_assistant_wiring_command(root)})
+    plan.append({"kind": "smoke", "command": home_assistant_import_command(root)})
     return plan
 
 
@@ -769,6 +996,9 @@ def validate_reexec_plan(
     current_context = next((item for item in current if item.get("kind") == "context"), None)
     if _serialized_plan([confirmed_context]) != _serialized_plan([current_context]):
         raise ValueError("confirmed bootstrap intent changed before re-exec")
+    project_kinds = {"configuration", "setup", "wiring", "smoke"}
+    if _serialized_plan([item for item in confirmed if item.get("kind") in project_kinds]) != _serialized_plan([item for item in current if item.get("kind") in project_kinds]):
+        raise ValueError("re-exec introduced an unconfirmed project action")
     confirmed_actions = [item for item in confirmed if item.get("kind") in {"package", "installer"}]
     for action in (item for item in current if item.get("kind") in {"package", "installer"}):
         if action in confirmed_actions:
@@ -789,12 +1019,26 @@ def validate_reexec_plan(
 def render_plan(plan: Sequence[Mapping[str, object]], print_fn=print, *, secrets: set[str] | None = None) -> None:
     for item in plan:
         if command := item.get("command"):
-            print_fn(f"$ {display_command(command, secrets)}")
+            label = f"{item['kind']}: " if item.get("kind") in {"wiring", "smoke"} else ""
+            print_fn(f"{label}$ {display_command(command, secrets)}")
         elif item.get("kind") == "context":
             print_fn(f"Platform: {item['platform']}  Profile: {item['profile']}")
             print_fn(f"Repositories: {', '.join(item['repositories'])}")
+        elif item.get("kind") == "tool":
+            print_fn(f"Tool {item['tool']}: {item.get('installed') or 'unavailable'}")
+        elif item.get("kind") == "setup":
+            for command in item["commands"]:
+                print_fn(f"Setup {item['name']} ({item['cwd']}): $ {display_command(command, secrets)}")
+        elif item.get("kind") == "configuration":
+            print_fn(f"{str(item['action']).capitalize()} local configuration: {item['path']}")
+            verb = "Reuse existing" if item["reuse_config"] else "Create"
+            print_fn(f"{verb} Home Assistant config: {item['config_dir']} (expected port {item['port']})")
+            print_fn(f"KNX mode: {item['knx_mode']}" + (" (hardware-free; no KNX connection is created)" if item["knx_mode"] == "automatic" else f"; secure material reference: {item['secure_config_path']}"))
+            if item["reuse_config"]:
+                print_fn("WARNING: Existing Home Assistant configuration is reused; verify its HTTP port and configured integrations before starting.")
         elif item.get("level") in {"warning", "info"}:
-            print_fn(f"{str(item['level']).upper()}: {item.get('message') or item.get('link', '')}")
+            label = "Docker (optional): " if item.get("tool") == "docker" else ""
+            print_fn(f"{str(item['level']).upper()}: {label}{item.get('message') or item.get('link', '')}")
         elif item.get("kind") == "manual":
             print_fn(f"MANUAL: install {item['tool']} — {item['link']}")
 
@@ -865,11 +1109,14 @@ def run_bootstrap(
         decisions=plan,
     )
     context = next((item for item in plan if item.get("kind") == "context"), {})
+    configuration = next((item for item in plan if item.get("kind") == "configuration"), None)
     execution = {
         "root": root, "profile": profile, "settings": settings,
         "tool_actions": plan, "jobs": jobs, "command_runner": runner,
         "repository_jobs": repository_jobs(root, {name: REPOSITORIES[name] for name in context.get("repositories", ())}),
-        "project_setup_jobs": [],
+        "project_setup_jobs": [Job(item["name"], Path(item["cwd"]), tuple(item["commands"])) for item in plan if item.get("kind") == "setup"],
+        "configuration": configuration,
+        "wire_home_assistant": wire_home_assistant if any(item.get("kind") == "wiring" for item in plan) else None,
         "reexec": reexec_with_plan if uv_will_be_installed else None,
     }
     try:
@@ -878,6 +1125,8 @@ def run_bootstrap(
             render_plan(plan, lines.append, secrets=progress.secrets)
             for index, line in enumerate(lines):
                 progress.emit(f"plan-{index + 1}", "planned", line)
+            if yes and configuration and configuration["reuse_config"] and not configuration["explicit_config"]:
+                raise ValueError("home_assistant.config_dir already exists; confirm reuse interactively or explicitly select its absolute path with XKNX_HA_CONFIG_DIR")
             if not yes:
                 progress.close()
                 prompt = "Execute this plan? [y/N] "
@@ -1082,9 +1331,18 @@ def load_settings(root: Path = ROOT, environ: Mapping[str, str] = os.environ) ->
         loaded = tomllib.loads(path.read_text())
         settings["profile"] = loaded.get("profile", settings["profile"])
         for section in ("home_assistant", "knx"):
+            if not isinstance(loaded.get(section, {}), dict):
+                raise ValueError(f"{section} must be a TOML table")
             settings[section].update(loaded.get(section, {}))
     if port := environ.get("XKNX_HA_PORT"):
-        settings["home_assistant"]["port"] = int(port)
+        try:
+            settings["home_assistant"]["port"] = int(port)
+        except ValueError:
+            raise ValueError("home_assistant.port / XKNX_HA_PORT must be an integer in 1..65535") from None
+    if config_dir := environ.get("XKNX_HA_CONFIG_DIR"):
+        settings["home_assistant"]["config_dir"] = config_dir
+    if mode := environ.get("XKNX_KNX_MODE"):
+        settings["knx"]["mode"] = mode
     return settings
 
 

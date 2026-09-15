@@ -589,3 +589,183 @@ def test_quoted_secrets_are_redacted_from_job_and_private_repository_output(tmp_
     content = capsys.readouterr().out + "".join(path.read_text() for path in (tmp_path / "logs").glob("*.log"))
     assert "privatehead" not in content and "privatetail" not in content
     assert "***" in content
+
+
+def fake_planning_tools(monkeypatch) -> None:
+    monkeypatch.setattr(ws, "detect_platform", lambda: "macos")
+    monkeypatch.setattr(ws, "package_source_available", lambda platform: True)
+    monkeypatch.setattr(ws, "inspect_tool", lambda name, expectation=None: {
+        "kind": "tool", "tool": name, "installed": "1.0.0", "executable": f"/bin/{name}",
+    })
+    monkeypatch.setattr(ws, "inspect_docker", lambda platform: ws.docker_status(platform, None, False))
+
+
+def fake_ha_packages(root: Path) -> dict[str, str]:
+    paths = {}
+    for module, repository in {"xknx": "xknx", "xknxproject": "xknxproject", "knx_frontend": "knx-frontend", "knx_telegram_store": "knx-telegram-store"}.items():
+        path = root / repository / module / "__init__.py"
+        path.parent.mkdir(parents=True)
+        path.write_text("")
+        paths[module] = str(path)
+    interpreter = root / "home-assistant-core/.venv/bin/python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text(
+        f"#!{sys.executable}\nimport sys\n"
+        f"sys.path[:0] = {[str(Path(path).parent.parent) for path in paths.values()]!r}\n"
+        "sys.dont_write_bytecode = '-B' in sys.argv\n"
+        "index = sys.argv.index('-c')\ncode = sys.argv[index + 1]\nsys.argv = sys.argv[index + 1:]\nexec(code)\n"
+    )
+    interpreter.chmod(0o755)
+    return paths
+
+
+def test_plan_decline_lists_setup_configuration_wiring_and_smoke_without_mutation(tmp_path: Path, monkeypatch, capsys) -> None:
+    fake_planning_tools(monkeypatch)
+
+    def decline(prompt):
+        output = capsys.readouterr().out
+        for item in ("script/setup", "script/bootstrap", "uv sync", "requirements_testing.txt", "sqlite,postgres", ".xknx-dev.toml", "smoke", "Docker", "8123", "git"):
+            assert item in output
+        assert not list(tmp_path.iterdir())
+        return "n"
+
+    assert ws.run_bootstrap(tmp_path, "default", yes=False, argv=["bootstrap"], input_fn=decline, progress_mode="plain") == 1
+    assert not list(tmp_path.iterdir())
+
+
+def test_yes_rejects_existing_default_config_and_explicit_path_allows_shown_reuse(tmp_path: Path, monkeypatch, capsys) -> None:
+    fake_planning_tools(monkeypatch)
+
+    async def no_execution(plan, progress):
+        return 0
+
+    monkeypatch.setattr(ws, "bootstrap_workspace", no_execution)
+    config = tmp_path / "home-assistant-core/config"
+    config.mkdir(parents=True)
+    marker = config / "configuration.yaml"
+    marker.write_text("default_config:\nhttp:\n  server_port: 9999\n")
+    with pytest.raises(ValueError, match="XKNX_HA_CONFIG_DIR"):
+        ws.run_bootstrap(tmp_path, "default", yes=True, argv=["bootstrap", "--yes"], environ={})
+    assert not (tmp_path / ".xknx-dev.toml").exists()
+
+    async def execute(plan, progress):
+        ws.create_local_configuration(plan["configuration"], tmp_path)
+        return 0
+
+    monkeypatch.setattr(ws, "bootstrap_workspace", execute)
+    (tmp_path / ".xknx-dev.example.toml").write_text((ws.ROOT / ".xknx-dev.example.toml").read_text())
+    assert ws.run_bootstrap(tmp_path, "default", yes=True, argv=["bootstrap", "--yes"], environ={"XKNX_HA_CONFIG_DIR": str(config)}) == 0
+    assert "Reuse existing Home Assistant config" in capsys.readouterr().out
+    assert marker.read_text() == "default_config:\nhttp:\n  server_port: 9999\n"
+
+
+def test_configuration_creation_follows_confirmation_and_does_not_overwrite(tmp_path: Path, monkeypatch) -> None:
+    fake_planning_tools(monkeypatch)
+    example = (ws.ROOT / ".xknx-dev.example.toml").read_text()
+    (tmp_path / ".xknx-dev.example.toml").write_text(example)
+    prompts = []
+
+    def confirm(prompt):
+        assert not (tmp_path / ".xknx-dev.toml").exists()
+        prompts.append(prompt)
+        return "y"
+
+    async def execute(plan, progress):
+        ws.create_local_configuration(plan["configuration"], tmp_path)
+        ws.create_home_assistant_configuration(plan["configuration"])
+        return 0
+
+    monkeypatch.setattr(ws, "bootstrap_workspace", execute)
+    assert ws.run_bootstrap(tmp_path, "default", yes=False, argv=["bootstrap"], input_fn=confirm, environ={"XKNX_HA_PORT": "9123"}) == 0
+    assert len(prompts) == 1
+    assert (tmp_path / ".xknx-dev.toml").read_text() == example
+    yaml = tmp_path / "home-assistant-core/config/configuration.yaml"
+    assert yaml.read_text() == "default_config:\nhttp:\n  server_port: 9123\n"
+    yaml.write_text("developer-owned\n")
+    action = ws.configuration_action(tmp_path, ws.load_settings(tmp_path, {}))
+    ws.create_local_configuration(action, tmp_path)
+    ws.create_home_assistant_configuration(action)
+    assert yaml.read_text() == "developer-owned\n"
+
+
+def test_package_status_imports_with_ha_python_and_rejects_sibling_and_symlink_paths(tmp_path: Path, monkeypatch) -> None:
+    paths = fake_ha_packages(tmp_path)
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "wrong-pythonpath"))
+    status = ws.package_status(tmp_path)
+    assert {name: item["path"] for name, item in status.items()} == paths
+    assert all(item["ok"] for item in status.values())
+    assert not list(tmp_path.rglob("__pycache__"))
+    outside = tmp_path / "xknx-other.py"
+    outside.write_text("")
+    Path(paths["xknx"]).unlink()
+    Path(paths["xknx"]).symlink_to(outside)
+    status = ws.package_status(tmp_path)
+    assert not status["xknx"]["ok"]
+    assert status["xknx"]["path"] == str(outside)
+    assert "root checkout" in status["xknx"]["error"]
+
+
+def test_setup_environment_is_local_then_wiring_verifies_all_packages(tmp_path: Path, monkeypatch, capsys) -> None:
+    paths = fake_ha_packages(tmp_path)
+    monkeypatch.setenv("VIRTUAL_ENV", "/workspace/controller-venv")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/workspace/controller-venv")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    uv = bin_dir / "uv"
+    uv.write_text(
+        f"#!{sys.executable}\nimport json, pathlib, sys\n"
+        "assert pathlib.Path('setup.done').exists()\n"
+        "pathlib.Path('wired.json').write_text(json.dumps(sys.argv[1:]))\n"
+    )
+    uv.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
+    setup = ws.Job("setup", tmp_path, ([sys.executable, "-c", "import os, pathlib; assert 'VIRTUAL_ENV' not in os.environ; assert 'UV_PROJECT_ENVIRONMENT' not in os.environ; pathlib.Path('setup.done').touch()"],))
+    plan = {"root": tmp_path, "tool_actions": [], "repository_jobs": [], "project_setup_jobs": [setup], "wire_home_assistant": ws.wire_home_assistant}
+    assert asyncio.run(ws.bootstrap_workspace(plan, ws.Progress("json", log_dir=tmp_path / "logs"))) == 0
+    assert json.loads((tmp_path / "wired.json").read_text()) == [
+        "pip", "install", "--python", str(tmp_path / "home-assistant-core/.venv/bin/python"),
+        "-e", str(tmp_path / "xknx"), "-e", str(tmp_path / "xknxproject"),
+        "-e", f"{tmp_path / 'knx-telegram-store'}[sqlite,postgres]", "-e", str(tmp_path / "knx-frontend"),
+    ]
+    output = capsys.readouterr().out
+    assert all(path in output for path in paths.values())
+    assert len(list((tmp_path / "logs").glob("*.log"))) == 2
+    assert os.environ["VIRTUAL_ENV"] == "/workspace/controller-venv"
+
+
+@pytest.mark.parametrize("outside_import", [False, True])
+def test_confirmed_bootstrap_creates_config_sets_up_then_checks_imports(tmp_path: Path, monkeypatch, outside_import: bool) -> None:
+    fake_planning_tools(monkeypatch)
+    paths = fake_ha_packages(tmp_path)
+    if outside_import:
+        outside = tmp_path / "outside.py"
+        outside.write_text("")
+        Path(paths["xknx"]).unlink()
+        Path(paths["xknx"]).symlink_to(outside)
+    (tmp_path / ".xknx-dev.example.toml").write_text((ws.ROOT / ".xknx-dev.example.toml").read_text())
+    core = tmp_path / "home-assistant-core"
+    script = core / "script/setup"
+    script.parent.mkdir()
+    script.write_text(
+        f"#!{sys.executable}\nimport os, pathlib\n"
+        "assert 'VIRTUAL_ENV' not in os.environ\n"
+        "assert pathlib.Path('../.xknx-dev.toml').exists()\n"
+        "assert 'server_port: 9123' in pathlib.Path('config/configuration.yaml').read_text()\n"
+        "pathlib.Path('setup.done').touch()\n"
+    )
+    script.chmod(0o755)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    uv = bin_dir / "uv"
+    uv.write_text(
+        f"#!{sys.executable}\nimport pathlib\n"
+        "assert pathlib.Path('home-assistant-core/setup.done').exists()\n"
+        "pathlib.Path('wiring.done').touch()\n"
+    )
+    uv.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setattr(ws, "repository_jobs", lambda *args: [])
+    monkeypatch.setattr(ws, "project_setup_jobs", lambda *args, **kwargs: [ws.Job("Core", core, (["script/setup"],))])
+    assert ws.run_bootstrap(tmp_path, "default", yes=True, argv=["bootstrap", "--yes"], environ={"XKNX_HA_PORT": "9123"}, progress_mode="quiet") == (1 if outside_import else 0)
+    assert (tmp_path / "wiring.done").exists()
+    assert len(list((tmp_path / ".state/logs").glob("*.log"))) == 2

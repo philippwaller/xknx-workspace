@@ -1,6 +1,7 @@
 import asyncio
 import builtins
 import json
+import socket
 import subprocess
 from io import BytesIO
 from pathlib import Path
@@ -794,3 +795,196 @@ def test_sudo_plan_is_executed_once_without_authentication_rewriting(tmp_path: P
     assert lines == ["$ sudo apt-get install -y git"]
     assert commands == [["sudo", "apt-get", "install", "-y", "git"]]
     assert len(results) == 1 and results[0].returncode == 0
+
+
+def test_default_setup_uses_project_owned_commands() -> None:
+    jobs = {job.name: job.commands for job in ws.project_setup_jobs(Path("/workspace"), "default")}
+    assert jobs == {
+        "Home Assistant Core": (["script/setup"],),
+        "KNX Frontend": (ws.nvm_shell(["script/bootstrap"]),),
+        "XKNX": (["uv", "sync", "--group", "dev", "--locked"],),
+        "XKNX Project": (["uv", "venv"], ["uv", "pip", "install", "--python", ".venv/bin/python", "-e", ".", "-r", "requirements_testing.txt"]),
+        "KNX Telegram Store": (["uv", "venv"], ["uv", "pip", "install", "--python", ".venv/bin/python", "-e", ".[dev,sqlite,postgres]"]),
+    }
+
+
+def test_optional_setup_and_development_commands_keep_frontends_independent(tmp_path: Path) -> None:
+    setup = {str(job.cwd.relative_to(tmp_path)): job.commands for job in ws.project_setup_jobs(tmp_path, "all")}
+    assert setup["home-assistant-frontend"] == (ws.nvm_shell(["script/setup"]),)
+    assert setup["xknxtoolkit"] == (["uv", "sync"],)
+    assert setup["xknx/docs"] == (["bundle", "install"],)
+    assert setup["home-assistant.io"] == (["bundle", "install"], ws.nvm_shell(["npm", "ci"]))
+    development = {str(job.cwd.relative_to(tmp_path)): job.commands for job in ws.project_development_jobs(tmp_path, "all")}
+    assert development == {
+        "knx-frontend": (ws.nvm_shell(["script/develop"]),),
+        "home-assistant-frontend": (ws.nvm_shell(["script/develop"]),),
+        "xknxtoolkit": (["uv", "run", "python", "-m", "knx_gui.main"],),
+        "xknx/docs": (["bundle", "exec", "jekyll", "serve"],),
+        "home-assistant.io": (["bundle", "exec", "rake", "preview"],),
+    }
+    assert not any("homeassistant-frontend" in path for path in setup | development)
+
+
+def test_home_assistant_wiring_and_start_use_ha_python_and_root_checkouts(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert ws.home_assistant_wiring_command(Path(".")) == [
+        "uv", "pip", "install", "--python", str(tmp_path / "home-assistant-core/.venv/bin/python"),
+        "-e", str(tmp_path / "xknx"), "-e", str(tmp_path / "xknxproject"),
+        "-e", f"{tmp_path / 'knx-telegram-store'}[sqlite,postgres]", "-e", str(tmp_path / "knx-frontend"),
+    ]
+    assert ws.home_assistant_command(Path("."), {"port": 9123, "config_dir": "home-assistant-core/config"}) == [
+        str(tmp_path / "home-assistant-core/.venv/bin/python"), "-m", "homeassistant",
+        "--config", str(tmp_path / "home-assistant-core/config"), "--skip-pip-packages",
+        "xknx,xknxproject,knx-frontend,knx-telegram-store",
+    ]
+
+
+@pytest.mark.parametrize("port", [0, 65536, True, "8123"])
+def test_configuration_rejects_invalid_ports_without_writing(tmp_path: Path, port) -> None:
+    settings = ws.load_settings(tmp_path, {})
+    settings["home_assistant"]["port"] = port
+    with pytest.raises(ValueError, match="home_assistant.port"):
+        ws.configuration_action(tmp_path, settings)
+    assert not list(tmp_path.iterdir())
+
+
+def test_configuration_rejects_occupied_ports_with_precise_override(tmp_path: Path) -> None:
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        settings = ws.load_settings(tmp_path, {"XKNX_HA_PORT": str(server.getsockname()[1])})
+        with pytest.raises(ValueError, match="XKNX_HA_PORT"):
+            ws.configuration_action(tmp_path, settings)
+
+
+def test_configuration_resolves_and_validates_paths_and_secure_references(tmp_path: Path) -> None:
+    settings = ws.load_settings(tmp_path, {})
+    settings["home_assistant"]["config_dir"] = "../outside"
+    with pytest.raises(ValueError, match="home_assistant.config_dir"):
+        ws.configuration_action(tmp_path, settings)
+    outside = tmp_path.parent / f"{tmp_path.name}-explicit"
+    settings["home_assistant"]["config_dir"] = str(outside)
+    assert ws.configuration_action(tmp_path, settings)["config_dir"] == str(outside)
+    (tmp_path / "linked").symlink_to(tmp_path.parent, target_is_directory=True)
+    settings["home_assistant"]["config_dir"] = "linked/escaped"
+    with pytest.raises(ValueError, match="home_assistant.config_dir"):
+        ws.configuration_action(tmp_path, settings)
+    settings["home_assistant"]["config_dir"] = "config"
+    settings["knx"] = {"mode": "real", "password": "never-echo-this"}
+    with pytest.raises(ValueError) as error:
+        ws.configuration_action(tmp_path, settings)
+    assert "never-echo-this" not in str(error.value)
+    settings["knx"] = {"mode": "real"}
+    with pytest.raises(ValueError, match="knx.secure_config_path"):
+        ws.configuration_action(tmp_path, settings)
+    secure = tmp_path / "secure.yaml"
+    secure.write_text("password: never-echo-this")
+    settings["knx"]["secure_config_path"] = str(secure)
+    action = ws.configuration_action(tmp_path, settings)
+    assert action["secure_config_path"] == str(secure)
+    assert "never-echo-this" not in repr(action)
+
+
+def test_settings_support_only_approved_environment_overrides(tmp_path: Path) -> None:
+    settings = ws.load_settings(tmp_path, {"XKNX_HA_PORT": "9123", "XKNX_HA_CONFIG_DIR": "my-config", "XKNX_KNX_MODE": "real"})
+    assert settings["home_assistant"] == {"port": 9123, "config_dir": "my-config"}
+    assert settings["knx"]["mode"] == "real"
+
+
+def test_configuration_rejects_an_occupied_ipv6_port(tmp_path: Path) -> None:
+    with socket.socket(socket.AF_INET6) as server:
+        server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        server.bind(("::1", 0))
+        settings = ws.load_settings(tmp_path, {"XKNX_HA_PORT": str(server.getsockname()[1])})
+        with pytest.raises(ValueError, match="XKNX_HA_PORT"):
+            ws.configuration_action(tmp_path, settings)
+
+
+def test_configuration_rejects_secret_fields_in_any_section(tmp_path: Path) -> None:
+    settings = ws.load_settings(tmp_path, {})
+    settings["home_assistant"]["token"] = "never-echo-this"
+    with pytest.raises(ValueError) as error:
+        ws.configuration_action(tmp_path, settings)
+    assert "never-echo-this" not in str(error.value)
+
+
+def test_config_creation_rejects_a_directory_symlink_added_after_confirmation(tmp_path: Path) -> None:
+    action = ws.configuration_action(tmp_path, ws.load_settings(tmp_path, {}))
+    external = tmp_path / "other"
+    external.mkdir()
+    (tmp_path / "home-assistant-core").mkdir()
+    (tmp_path / "home-assistant-core/config").symlink_to(external, target_is_directory=True)
+    with pytest.raises(ValueError, match="config_dir.*changed"):
+        ws.create_home_assistant_configuration(action)
+    assert not list(external.iterdir())
+
+
+def test_docs_block_only_their_setup_jobs_after_checkout(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(ws, "docs_prerequisite_actions", lambda root, profile: [{
+        "kind": "manual", "scope": "docs", "blocking": True, "tool": "ruby",
+        "repository": "xknx/docs", "expected": "9.9.9", "link": "https://example.invalid/ruby",
+    }])
+    jobs = [ws.Job(name, tmp_path / path, ([ws.sys.executable, "-c", "from pathlib import Path; Path('setup.done').touch()"],)) for name, path in (("Core", "home-assistant-core"), ("XKNX Docs", "xknx/docs"), ("HA Docs", "home-assistant.io"))]
+    for job in jobs:
+        job.cwd.mkdir(parents=True)
+    plan = {"root": tmp_path, "profile": "docs", "repository_jobs": [], "project_setup_jobs": jobs}
+    assert asyncio.run(ws.bootstrap_workspace(plan, ws.Progress("plain", log_dir=tmp_path / "logs"))) == 2
+    assert (tmp_path / "home-assistant-core/setup.done").exists()
+    assert (tmp_path / "home-assistant.io/setup.done").exists()
+    assert not (tmp_path / "xknx/docs/setup.done").exists()
+    assert "9.9.9" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("kind", ["setup", "wiring", "smoke", "configuration"])
+def test_reexec_rejects_changed_project_actions(kind: str) -> None:
+    confirmed = [{"kind": kind, "command": ["confirmed"]}]
+    current = [{"kind": kind, "command": ["different"]}]
+    with pytest.raises(ValueError, match="unconfirmed project action"):
+        ws.validate_reexec_plan(confirmed, current)
+
+
+def test_bootstrap_revalidates_changed_local_settings_before_prerequisites(tmp_path: Path) -> None:
+    config = tmp_path / ".xknx-dev.toml"
+    config.write_text('[home_assistant]\nport = 8123\n')
+    settings = ws.load_settings(tmp_path, {})
+    action = ws.configuration_action(tmp_path, settings)
+    config.write_text('[home_assistant]\nport = 9123\n')
+    calls = []
+    plan = {
+        "root": tmp_path, "configuration": action, "settings": settings,
+        "tool_actions": [{"kind": "package", "command": ["must-not-run"]}],
+        "command_runner": lambda command, **kwargs: calls.append(command) or CompletedProcess(command, 0),
+    }
+    with pytest.raises(ValueError, match="configuration changed after confirmation"):
+        asyncio.run(ws.bootstrap_workspace(plan, ws.Progress("quiet", log_dir=tmp_path / "logs")))
+    assert not calls
+
+
+def test_reused_ha_config_uses_only_dependency_bootstrap(tmp_path: Path) -> None:
+    jobs = ws.project_setup_jobs(tmp_path, "default", reuse_ha_config=True)
+    ha = next(job for job in jobs if job.name == "Home Assistant Core")
+    assert ha.commands == (["uv", "venv"], ["bash", "-c", ". .venv/bin/activate && script/bootstrap"])
+
+
+def test_existing_python_environments_are_reused_without_recreation(tmp_path: Path) -> None:
+    for repository in ("home-assistant-core", "xknxproject", "knx-telegram-store"):
+        interpreter = tmp_path / repository / ".venv/bin/python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.touch()
+    jobs = {job.name: job.commands for job in ws.project_setup_jobs(tmp_path, "default")}
+    assert jobs["Home Assistant Core"] == (["bash", "-c", ". .venv/bin/activate && script/setup"],)
+    assert all(["uv", "venv"] not in commands for commands in jobs.values())
+    assert jobs["XKNX Project"][0][:3] == ["uv", "pip", "install"]
+    jobs = {job.name: job.commands for job in ws.project_setup_jobs(tmp_path, "default", reuse_ha_config=True)}
+    assert jobs["Home Assistant Core"] == (["bash", "-c", ". .venv/bin/activate && script/bootstrap"],)
+
+
+def test_invalid_setting_types_report_the_exact_key_without_echoing_values(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="XKNX_HA_PORT") as error:
+        ws.load_settings(tmp_path, {"XKNX_HA_PORT": "never-echo-this"})
+    assert "never-echo-this" not in str(error.value)
+    (tmp_path / ".xknx-dev.toml").write_text("knx = 1\n")
+    with pytest.raises(ValueError, match="knx.*table"):
+        ws.load_settings(tmp_path, {})
+    settings = {"knx": {"mode": []}}
+    with pytest.raises(ValueError, match="knx.mode"):
+        ws.configuration_action(tmp_path, settings)
