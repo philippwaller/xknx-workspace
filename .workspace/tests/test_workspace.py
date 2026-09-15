@@ -804,7 +804,7 @@ def test_default_setup_uses_project_owned_commands() -> None:
     jobs = {job.name: job.commands for job in ws.project_setup_jobs(Path("/workspace"), "default")}
     assert jobs == {
         "Home Assistant Core": (["script/setup"],),
-        "KNX Frontend": (ws.nvm_shell(["script/bootstrap"]),),
+        "KNX Frontend": (ws.nvm_shell(["script/bootstrap"]), ws.nvm_shell(["script/build"])),
         "XKNX": (["uv", "sync", "--group", "dev", "--locked"],),
         "XKNX Project": (["uv", "venv"], ["uv", "pip", "install", "--python", ".venv/bin/python", "-e", ".", "-r", "requirements_testing.txt"]),
         "KNX Telegram Store": (["uv", "venv"], ["uv", "pip", "install", "--python", ".venv/bin/python", "-e", ".[dev,sqlite,postgres]"]),
@@ -1053,3 +1053,108 @@ def test_yaml_appearing_during_config_creation_requires_a_new_plan(tmp_path: Pat
     with pytest.raises(ValueError, match="config_dir.*changed"):
         ws.create_home_assistant_configuration(action)
     assert (directory / "configuration.yaml").read_text() == "developer-owned\n"
+
+
+def test_status_has_stable_schema_and_missing_items_are_actionable(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(ws.shutil, "which", lambda name: None)
+    monkeypatch.setenv("NVM_DIR", str(tmp_path / "missing-nvm"))
+    status = ws.collect_status(tmp_path, ws.load_settings(tmp_path, {}))
+    assert set(status) == {"workspace", "profile", "platform", "configuration", "tools", "docker", "repositories", "packages", "processes", "smoke"}
+    assert status["tools"]["git"]["relation"] == "missing"
+    assert status["repositories"]["xknx"]["action"] == "missing"
+    assert "./bootstrap toolkit" in status["repositories"]["xknxtoolkit"]["error"]
+    assert not status["packages"]["xknx"]["ok"]
+    assert status["processes"]["expected"]["home-assistant"]["action"] == "./dev start default"
+    assert status["smoke"]["status"] == "not-run"
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("content", ['[knx]\nmode="real"\npassword="do-not-print"\n', '[knx]\nmode="do-not-print"\n', 'password = "do-not-print'])
+def test_status_json_reports_invalid_configuration_without_secrets(tmp_path: Path, monkeypatch, capsys, content: str) -> None:
+    (tmp_path / ".xknx-dev.toml").write_text(content)
+    monkeypatch.setattr(ws, "ROOT", tmp_path)
+    monkeypatch.setattr(ws.shutil, "which", lambda name: None)
+    monkeypatch.setenv("NVM_DIR", str(tmp_path / "missing-nvm"))
+    assert ws.main(["dev", "status", "--format", "json"]) == 0
+    output = capsys.readouterr()
+    status = json.loads(output.out)
+    assert status["configuration"]["conflicts"]
+    assert "do-not-print" not in output.out + output.err
+
+
+def test_status_reports_config_paths_and_conflicts_without_reading_secure_material(tmp_path: Path, monkeypatch) -> None:
+    secure = tmp_path / "secure.yaml"
+    secure.write_text("password: do-not-print\n")
+    settings = ws.load_settings(tmp_path, {})
+    settings["knx"] = {"mode": "real", "secure_config_path": str(secure)}
+    settings["home_assistant"]["config_dir"] = "../outside"
+    monkeypatch.setattr(ws.shutil, "which", lambda name: None)
+    monkeypatch.setenv("NVM_DIR", str(tmp_path / "missing-nvm"))
+    status = ws.collect_status(tmp_path, settings)
+    assert "config_dir" in " ".join(status["configuration"]["conflicts"])
+    assert status["configuration"]["effective"]["knx"]["secure_config_path"] == str(secure)
+    assert "do-not-print" not in json.dumps(status)
+
+
+def test_toolkit_smoke_never_claims_an_unavailable_roundtrip(tmp_path: Path) -> None:
+    result = ws.toolkit_smoke(tmp_path)
+    assert result["status"] == "skipped"
+    assert result["acceptance_satisfied"] is False
+    assert "public" in result["reason"] and "readiness" in result["reason"] and "send" in result["reason"]
+    assert not list(tmp_path.iterdir())
+
+
+def test_process_status_distinguishes_missing_dead_and_recovery_shells(monkeypatch) -> None:
+    monkeypatch.setattr(ws, "tmux_status", lambda: {
+        "session": "xknx-dev", "running": True, "windows": [
+            {"name": "overview", "dead": False, "command": "zsh", "exit_code": None},
+            {"name": "home-assistant", "dead": True, "command": "python", "exit_code": 7},
+            {"name": "knx-frontend", "dead": False, "command": "zsh", "exit_code": None},
+        ],
+    })
+    status = ws.process_status("toolkit")
+    assert status["expected"]["overview"]["state"] == "running"
+    assert status["expected"]["home-assistant"]["state"] == "exited"
+    assert "7" in status["expected"]["home-assistant"]["detail"]
+    assert status["expected"]["knx-frontend"]["state"] == "command"
+    assert status["expected"]["toolkit"]["state"] == "missing"
+    assert all(item["action"] for name, item in status["expected"].items() if name != "overview")
+
+
+def test_status_reports_optional_docker_installed_and_unreachable(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(ws, "inspect_docker", lambda platform: ws.docker_status(platform, "/test/docker", False))
+    monkeypatch.setattr(ws, "inspect_tool", lambda name: {"installed": None, "executable": None})
+    status = ws.collect_status(tmp_path, ws.load_settings(tmp_path, {}))
+    assert status["docker"]["installed"] is True
+    assert status["docker"]["daemon_reachable"] is False
+    assert status["docker"]["required"] is False
+
+
+def test_status_handles_unsupported_platform_and_inspector_failures(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(ws, "detect_platform", lambda: "unsupported")
+
+    def unavailable(*args):
+        raise OSError("not installed")
+
+    monkeypatch.setattr(ws, "inspect_tool", unavailable)
+    monkeypatch.setattr(ws, "tmux_status", unavailable)
+    status = ws.collect_status(tmp_path, ws.load_settings(tmp_path, {}))
+    assert status["platform"] == "unsupported"
+    assert status["processes"]["error"]
+    assert status["tools"]["git"]["error"]
+
+
+def test_default_smoke_keeps_docker_out_of_the_required_path(tmp_path: Path, monkeypatch) -> None:
+    def forbidden(*args):
+        raise AssertionError("Default smoke must never depend on Docker")
+
+    monkeypatch.setattr(ws, "inspect_docker", forbidden)
+    assert ws.check_default_smoke(tmp_path, ws.load_settings(tmp_path, {}))["status"] == "failed"
+
+
+def test_status_preserves_this_invocations_smoke_result(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(ws, "inspect_tool", lambda name: {"installed": None, "executable": None})
+    monkeypatch.setattr(ws, "inspect_docker", lambda platform: ws.docker_status(platform, None, False))
+    smoke = {"status": "completed", "default": {"status": "passed", "acceptance_satisfied": True}}
+    status = ws.collect_status(tmp_path, ws.load_settings(tmp_path, {}), smoke=smoke)
+    assert status["smoke"] == smoke

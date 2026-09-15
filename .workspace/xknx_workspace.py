@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -96,6 +97,11 @@ NVM_RELEASE_API = "https://api.github.com/repos/nvm-sh/nvm/releases/latest"
 TMUX_SESSION = "xknx-dev"
 TMUX_TARGET = f"={TMUX_SESSION}"
 TMUX_STATUS_FORMAT = "#{window_name}\t#{pane_dead}\t#{pane_current_command}\t#{pane_dead_status}"
+KNX_FRONTEND_ARTIFACTS = (
+    "knx-frontend/knx_frontend/__init__.py", "knx-frontend/knx_frontend/constants.py",
+    "knx-frontend/knx_frontend/frontend_latest/manifest.json",
+    "knx-frontend/knx_frontend/frontend_es5/manifest.json",
+)
 
 
 @dataclass
@@ -471,8 +477,11 @@ async def bootstrap_workspace(plan: dict[str, object], progress: Progress) -> in
                 return code
         if smoke := plan.get("smoke_default"):
             pending_callbacks.remove("smoke_default")
-            if not await smoke(plan, progress):
-                return 1
+            result = await smoke(plan, progress)
+            smoke_code = int(not result) if isinstance(result, bool) else result
+            if smoke_code:
+                code = smoke_code
+                return code
         code = 2 if blocked_docs else 0
         return code
     except (asyncio.CancelledError, KeyboardInterrupt):
@@ -625,7 +634,7 @@ def project_setup_jobs(
             ["uv", "venv"],
             ["uv", "pip", "install", "--python", ".venv/bin/python", "-e", ".[dev,sqlite,postgres]"],
         )),
-        "knx-frontend": ("KNX Frontend", (nvm_shell(["script/bootstrap"]),)),
+        "knx-frontend": ("KNX Frontend", (nvm_shell(["script/bootstrap"]), nvm_shell(["script/build"]))),
         "home-assistant-frontend": ("Home Assistant Frontend", (nvm_shell(["script/setup"]),)),
         "xknxtoolkit": ("XKNX Toolkit", (["uv", "sync"],)),
         "home-assistant.io": ("Home Assistant Docs", (["bundle", "install"], nvm_shell(["npm", "ci"]))),
@@ -816,6 +825,10 @@ def configuration_action(root: Path, settings: Mapping[str, object]) -> dict[str
         except OSError as error:
             if family == socket.AF_INET6 and error.errno in {errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL, errno.EPROTONOSUPPORT}:
                 continue
+            if error.errno == errno.EADDRINUSE:
+                processes = process_status(settings.get("profile", "default"))
+                if processes["expected"]["home-assistant"]["state"] == "running" and home_assistant_http({"home_assistant": ha})["ok"]:
+                    continue
             raise ValueError(f"home_assistant.port {port} is unavailable; set XKNX_HA_PORT to a free port") from error
     raw_path = ha["config_dir"]
     config_dir = (root / raw_path).resolve()
@@ -903,6 +916,163 @@ def package_status(root: Path, runner=subprocess.run) -> dict[str, dict[str, obj
     return status
 
 
+def process_status(profile: str) -> dict[str, object]:
+    try:
+        status = tmux_status()
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        status = {"session": TMUX_SESSION, "running": False, "windows": [], "error": "tmux unavailable; run bootstrap to install it"}
+    windows = {window["name"]: window for window in status["windows"]}
+    expected = {}
+    for name in tmux_windows(profile):
+        window = windows.get(name)
+        action = f"./dev start {profile}" if not status["running"] else f"tmux select-window -t {TMUX_SESSION}:{name}; inspect the pane and rerun its command"
+        if window is None:
+            state, detail = "missing", f"{name} window missing; {action}"
+            if status["running"]:
+                action = f"./dev stop && ./dev start {profile} (restart the session when ready)"
+                detail = f"{name} window missing; {action}"
+        elif window["dead"]:
+            state, detail = "exited", f"{name} exited {window['exit_code']}; {action}"
+        elif name != "overview" and Path(window["command"]).name in {"sh", "bash", "zsh", "fish", "dash", "ksh"}:
+            state, detail = "command", f"{name} has a shell, not a confirmed service; {action}"
+        else:
+            state, detail, action = "running", f"{name} running {window['command']}", None
+        expected[name] = {"state": state, "detail": detail, "action": action}
+    return {**status, "profile": profile, "expected": expected}
+
+
+class _NoHTTPRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def home_assistant_http(settings: Mapping[str, object], *, timeout: float = 2) -> dict[str, object]:
+    url = f"http://127.0.0.1:{settings['home_assistant']['port']}/"
+    code = None
+    try:
+        # A redirect itself proves reachability; never follow it to another host.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoHTTPRedirect())
+        with opener.open(url, timeout=timeout) as response:
+            code = response.status
+    except urllib.error.HTTPError as error:
+        code = error.code
+        error.close()
+    except (OSError, ValueError):
+        pass
+    ok = code in {200, 302, 401}
+    detail = f"{url} HTTP {code}" if code is not None else f"{url} is unreachable"
+    if not ok:
+        detail += f"; inspect {TMUX_SESSION}:home-assistant or .state/logs and verify home_assistant.port / XKNX_HA_PORT"
+    return {"ok": ok, "url": url, "http_code": code, "detail": detail}
+
+
+def frontend_status(root: Path, processes: Mapping[str, object]) -> dict[str, object]:
+    artifacts = [root / path for path in KNX_FRONTEND_ARTIFACTS]
+    built = all(path.is_file() for path in artifacts)
+    pane = processes["expected"]["knx-frontend"]
+    # ponytail: the documented Node watcher pane is the development readiness signal;
+    # use an upstream health endpoint if the adapter gains one.
+    serving = pane["state"] == "running" and any(
+        window["name"] == "knx-frontend" and (window["command"].startswith("node") or window["command"].startswith("gulp"))
+        for window in processes["windows"]
+    )
+    return {
+        "ok": built or serving, "state": "built" if built else "serving" if serving else "missing",
+        "artifacts": [str(path) for path in artifacts],
+        "detail": "KNX frontend build artifacts exist" if built else "KNX frontend development watcher is active" if serving else
+        f"KNX frontend build missing; run ./bootstrap {processes.get('profile', 'default')} or inspect {TMUX_SESSION}:knx-frontend (script/build / script/develop)",
+    }
+
+
+def check_default_smoke(root: Path, settings: Mapping[str, object], *, processes=None, packages=None, http=None) -> dict[str, object]:
+    processes = processes if processes is not None else process_status(settings["profile"])
+    packages = packages if packages is not None else package_status(root)
+    failed = [f"{name}: {item['error']}" for name, item in packages.items() if not item["ok"]]
+    inactive = [item["detail"] for item in processes["expected"].values() if item["state"] != "running"]
+    process_ok = not processes["running"] or not inactive
+    checks = {
+        "home-assistant": http if http is not None else home_assistant_http(settings),
+        "packages": {"ok": not failed, "detail": "; ".join(failed) + "; inspect .state/logs; run bootstrap to wire local packages" if failed else "All four HA imports resolve below their root checkouts"},
+        "knx-frontend": frontend_status(root, processes),
+        "tmux": {"ok": process_ok, "state": "running" if not inactive else "actionable", "detail": "; ".join(inactive) if inactive else "All expected tmux windows are running"},
+    }
+    ok = all(item["ok"] for item in checks.values())
+    return {"status": "passed" if ok else "failed", "acceptance_satisfied": ok, "checks": checks}
+
+
+TOOLKIT_GROUP_ADDRESS = "1/1/1"
+TOOLKIT_GROUP_VALUE = 1
+
+
+def toolkit_smoke(root: Path) -> dict[str, object]:
+    return {
+        "status": "skipped", "acceptance_satisfied": False,
+        "group_address": TOOLKIT_GROUP_ADDRESS, "value": TOOLKIT_GROUP_VALUE,
+        "reason": "xknxtoolkit has no stable public non-interactive virtual endpoint readiness signal or group-write send command/API for its running pane. VirtualRouter.state/send_cemi are GUI internals; no telegram roundtrip or persistence record was verified.",
+        "source": "https://github.com/XKNX/xknxtoolkit/tree/693ed48a3eb5e5ef7c8470a57572abbac24a3935/apps/knx-gui",
+    }
+
+
+async def smoke_default(plan: dict[str, object], progress: Progress, *, timeout: float = 60) -> int:
+    root = plan["root"]
+    settings = {**plan["settings"], "profile": plan.get("profile", plan["settings"]["profile"])}
+    processes = process_status(settings["profile"])
+    command = home_assistant_command(root, settings["home_assistant"])
+    process = completion = None
+    code, stdout, stderr = 1, b"", b""
+    start, clock_start = datetime.now(timezone.utc), time.monotonic()
+    try:
+        if processes["running"]:
+            progress.emit("smoke-home-assistant", "running", f"Reusing {TMUX_SESSION}:home-assistant; inspect that pane for output")
+        else:
+            progress.emit("smoke-home-assistant", "running", f"Starting temporary foreground child: {display_command(command, progress.secrets)}")
+            process = await asyncio.create_subprocess_exec(
+                *command, cwd=root / "home-assistant-core", stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE, start_new_session=True,
+            )
+            completion = asyncio.create_task(process.communicate())
+        deadline = time.monotonic() + timeout
+        while True:
+            http = await asyncio.to_thread(home_assistant_http, settings, timeout=min(2, max(0.01, deadline - time.monotonic())))
+            if process is not None and process.returncode is not None:
+                code = process.returncode or 1
+                http = {**http, "ok": False, "detail": f"Temporary Home Assistant exited {process.returncode}; inspect .state/logs"}
+                break
+            if http["ok"] or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.1)
+        result = check_default_smoke(root, settings, processes=processes, http=http)
+        plan["smoke"] = {"status": "completed", "default": result}
+        for name, check in result["checks"].items():
+            progress.emit(f"smoke-{name}", "success" if check["ok"] else "error", check["detail"])
+        if plan.get("profile", settings["profile"]) in {"toolkit", "all"}:
+            plan["smoke"]["toolkit"] = toolkit_smoke(root)
+            progress.emit("smoke-toolkit", "skipped", plan["smoke"]["toolkit"]["reason"])
+        code = 0 if result["acceptance_satisfied"] else code
+        return code
+    except OSError as error:
+        code = 127
+        stderr = str(error).encode()
+        plan["smoke"] = {"status": "completed", "default": {"status": "failed", "acceptance_satisfied": False, "reason": "Home Assistant could not start; inspect .state/logs and run bootstrap"}}
+        return code
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        code = 130
+        raise
+    finally:
+        if process is not None:
+            progress.emit("smoke-home-assistant", "running", "Stopping and reaping temporary foreground Home Assistant child")
+            if not completion.done():
+                await _stop_process(process, completion)
+            stdout, stderr = await completion
+        log = write_task_log(
+            progress.log_dir, "smoke-home-assistant", command=[command] if process is not None else [],
+            cwd=root / "home-assistant-core", stdout=stdout.decode(errors="replace") + "\n" + json.dumps(plan.get("smoke", {})), stderr=stderr.decode(errors="replace"),
+            returncode=code, start=start, duration=time.monotonic() - clock_start,
+            secrets=progress.secrets, versions=progress.versions, decisions=progress.decisions,
+        )
+        progress.emit("smoke-home-assistant", "success" if code == 0 else "error", f"Smoke exit {code}; log: {log}")
+
+
 async def wire_home_assistant(plan: Mapping[str, object], progress: Progress) -> int:
     root = plan["root"]
     result = await run_job(
@@ -977,6 +1147,130 @@ def inspect_docker(platform: str) -> dict[str, object]:
         == 0
     )
     return docker_status(platform, executable, reachable)
+
+
+def collect_status(root: Path, settings: Mapping[str, object] | None = None, *, smoke=None) -> dict[str, object]:
+    root = root.resolve()
+    conflicts = []
+    try:
+        settings = load_settings(root) if settings is None else settings
+        validate_settings_schema(settings)
+    except (OSError, tomllib.TOMLDecodeError):
+        conflicts.append("Cannot read .xknx-dev.toml as TOML; repair the local configuration (showing defaults)")
+        settings = DEFAULTS
+    except ValueError as error:
+        conflicts.append(f"{error}; repair .xknx-dev.toml or its environment override (showing defaults)")
+        settings = DEFAULTS
+    effective = {
+        "profile": settings.get("profile", "default"),
+        "home_assistant": {**DEFAULTS["home_assistant"], **settings.get("home_assistant", {})},
+        "knx": {**DEFAULTS["knx"], **settings.get("knx", {})},
+    }
+    profile, platform = effective["profile"], detect_platform()
+    raw_config = effective["home_assistant"]["config_dir"]
+    config_dir = (root / raw_config).resolve()
+    if not Path(raw_config).is_absolute() and not config_dir.is_relative_to(root):
+        conflicts.append("home_assistant.config_dir escapes the workspace; use an explicit absolute XKNX_HA_CONFIG_DIR")
+    if config_dir.exists() and not config_dir.is_dir():
+        conflicts.append("home_assistant.config_dir must be a directory")
+    secure = effective["knx"].get("secure_config_path")
+    if effective["knx"]["mode"] == "real" or secure:
+        if not secure or not (root / secure).is_file() or not os.access(root / secure, os.R_OK):
+            conflicts.append("knx.secure_config_path must reference a readable local file for real KNX mode")
+    local = root / ".xknx-dev.toml"
+    if local.is_symlink() or (local.exists() and not local.is_file()):
+        conflicts.append(".xknx-dev.toml must be a regular root-local file")
+
+    tools = {}
+    names = ["git", "uv", "tmux", "nvm", "node"]
+    if profile in {"docs", "all"}:
+        names.extend(["ruby", "bundle"])
+    for name in names:
+        try:
+            state = inspect_tool(name)
+        except (OSError, subprocess.TimeoutExpired):
+            state = {"tool": name, "installed": None, "executable": None, "error": "Version check unavailable; run bootstrap"}
+        tools[name] = {**state, "expected": None, "relation": "unconstrained" if state["installed"] else "missing"}
+    for name, version_file in (("node", ".nvmrc"), ("ruby", ".ruby-version")):
+        if name not in tools:
+            continue
+        requirements = {}
+        for repository in (*repositories_for(profile), *(('xknx/docs',) if profile in {'docs', 'all'} else ())):
+            path = root / repository / version_file
+            if path.is_file():
+                try:
+                    expected = path.read_text().strip()
+                except OSError:
+                    continue
+                if re.fullmatch(r"v?\d+(?:\.\d+)*", expected):
+                    requirements[repository] = version_decision(name, tools[name]["installed"], expected, False)
+                else:
+                    requirements[repository] = {"expected": expected, "relation": "unresolved locally"}
+        tools[name]["requirements"] = requirements
+    try:
+        docker = inspect_docker(platform) if platform in DOCKER_LINKS else {
+            "tool": "docker", "required": False, "available": False, "level": "info", "error": "Unsupported platform; inspect Docker manually",
+        }
+    except (OSError, subprocess.TimeoutExpired):
+        docker = {"tool": "docker", "required": False, "available": False, "level": "info", "error": "Docker daemon check unavailable"}
+    docker = {**docker, "installed": bool(docker.get("executable")), "daemon_reachable": docker["available"]}
+
+    def read_git(command, **kwargs):
+        return subprocess.run(command, **kwargs, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"}, timeout=10)
+
+    repositories = {}
+    for name in REPOSITORIES:
+        path = root / name
+        if not path.exists():
+            next_profile = profile if name in repositories_for(profile) else next(key for key, names in PROFILES.items() if name in names)
+            state = _empty_repository_status(path, f"Missing checkout; run ./bootstrap {next_profile}", "missing")
+        elif not (path / ".git").exists():
+            state = _empty_repository_status(path, "Existing path is not a Git checkout; inspect it before bootstrap", "conflict")
+        else:
+            try:
+                state = {**repository_status(path, read_git), "action": "observed"}
+            except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
+                state = _empty_repository_status(path, f"Git observation failed; inspect {path}: {error}", "error")
+        repositories[name] = {**state, "selected": name in repositories_for(profile), "comparison": "origin default branch from local refs; no fetch"}
+    processes = process_status(profile)
+    packages = package_status(root)
+    packages["knx_frontend"]["frontend"] = frontend_status(root, processes)
+    status = {
+        "workspace": str(root), "profile": profile, "platform": platform,
+        "configuration": {"effective": effective, "conflicts": conflicts, "config_dir": str(config_dir), "home_assistant": home_assistant_http(effective)},
+        "tools": tools, "docker": docker, "repositories": repositories, "packages": packages,
+        "processes": processes, "smoke": smoke if smoke is not None else {"status": "not-run"},
+    }
+    if profile in {"toolkit", "all"} and smoke is None:
+        status["smoke"]["toolkit"] = toolkit_smoke(root)
+    return json.loads(redact(json.dumps(status), secret_values()))
+
+
+def render_status(status: Mapping[str, object], format: str = "human", print_fn=print) -> None:
+    if format == "json":
+        print_fn(json.dumps(status))
+        return
+    rows = [
+        ("Workspace", status["workspace"]), ("Profile / platform", f"{status['profile']} / {status['platform']}"),
+        ("Configuration", json.dumps(status["configuration"]["effective"])),
+        ("Conflicts", "; ".join(status["configuration"]["conflicts"]) or "none"),
+        ("Home Assistant", status["configuration"]["home_assistant"]["detail"]),
+    ]
+    for name, item in status["tools"].items():
+        requirements = "; ".join(f"{repo}: expects {value['expected']} ({value['relation']})" for repo, value in item.get("requirements", {}).items())
+        rows.append((name, f"{item['installed'] or 'unavailable'} ({item['relation']})" + (f"; {requirements}" if requirements else "")))
+    docker = status["docker"]
+    rows.append(("Docker (optional)", "daemon reachable" if docker["available"] else f"daemon unavailable; {docker.get('error') or docker.get('link', '')}"))
+    for name, item in status["repositories"].items():
+        rows.append((name, item["error"] or f"{item['branch']} {'dirty' if item['dirty'] else 'clean'} ↑{item['ahead']} ↓{item['behind']} diverged={item['diverged']} (local refs)"))
+    for name, item in status["packages"].items():
+        rows.append((f"HA import {name}", f"{item['path'] or 'missing'}" + (f"; {item['error']}" if item['error'] else "")))
+    rows.append(("KNX frontend", status["packages"]["knx_frontend"]["frontend"]["detail"]))
+    rows.extend((f"tmux {name}", item["detail"]) for name, item in status["processes"]["expected"].items())
+    rows.append(("Smoke", json.dumps(status["smoke"])))
+    width = max(len(str(name)) for name, _ in rows)
+    for name, detail in rows:
+        print_fn(f"{name:<{width}}  {detail}")
 
 
 def docs_prerequisite_actions(root: Path, profile: str) -> list[dict[str, object]]:
@@ -1090,6 +1384,7 @@ def build_bootstrap_plan(
     )
     plan.append({"kind": "wiring", "command": home_assistant_wiring_command(root)})
     plan.append({"kind": "smoke", "command": home_assistant_import_command(root)})
+    plan.append({"kind": "smoke", "command": home_assistant_command(root, {**DEFAULTS["home_assistant"], **settings.get("home_assistant", {})}), "lifecycle": "temporary foreground Home Assistant; wait for HTTP, then terminate and reap before bootstrap returns; reuse an existing tmux Home Assistant pane"})
     return plan
 
 
@@ -1147,6 +1442,8 @@ def render_plan(plan: Sequence[Mapping[str, object]], print_fn=print, *, secrets
         if command := item.get("command"):
             label = f"{item['kind']}: " if item.get("kind") in {"wiring", "smoke"} else ""
             print_fn(f"{label}$ {display_command(command, secrets)}")
+            if lifecycle := item.get("lifecycle"):
+                print_fn(lifecycle)
         elif item.get("kind") == "context":
             print_fn(f"Platform: {item['platform']}  Profile: {item['profile']}")
             print_fn(f"Repositories: {', '.join(item['repositories'])}")
@@ -1243,6 +1540,8 @@ def run_bootstrap(
         "project_setup_jobs": [Job(item["name"], Path(item["cwd"]), tuple(item["commands"])) for item in plan if item.get("kind") == "setup"],
         "configuration": configuration,
         "wire_home_assistant": wire_home_assistant if any(item.get("kind") == "wiring" for item in plan) else None,
+        "smoke_default": smoke_default if any(item.get("kind") == "smoke" for item in plan) else None,
+        "expected_artifacts": {"KNX Frontend": [root / path for path in KNX_FRONTEND_ARTIFACTS]},
         "reexec": reexec_with_plan if uv_will_be_installed else None,
     }
     try:
@@ -1564,13 +1863,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Error: {error}", file=sys.stderr)
             return 2
     if args.dev_command == "status":
-        try:
-            status = tmux_status()
-            print_tmux_status(status, args.format)
-            return 0 if "error" not in status else 1
-        except (OSError, ValueError) as error:
-            print(f"Error: {error}", file=sys.stderr)
-            return 2
+        render_status(collect_status(ROOT), args.format)
+        return 0
     if args.dev_command == "stop":
         try:
             return stop_tmux()

@@ -8,7 +8,9 @@ import signal
 import subprocess
 import sys
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 
 import pytest
 
@@ -737,6 +739,9 @@ def test_setup_environment_is_local_then_wiring_verifies_all_packages(tmp_path: 
 @pytest.mark.parametrize("outside_import", [False, True])
 def test_confirmed_bootstrap_creates_config_sets_up_then_checks_imports(tmp_path: Path, monkeypatch, outside_import: bool) -> None:
     fake_planning_tools(monkeypatch)
+    with ws.socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
     paths = fake_ha_packages(tmp_path)
     if outside_import:
         outside = tmp_path / "outside.py"
@@ -751,7 +756,7 @@ def test_confirmed_bootstrap_creates_config_sets_up_then_checks_imports(tmp_path
         f"#!{sys.executable}\nimport os, pathlib\n"
         "assert 'VIRTUAL_ENV' not in os.environ\n"
         "assert pathlib.Path('../.xknx-dev.toml').exists()\n"
-        "assert 'server_port: 9123' in pathlib.Path('config/configuration.yaml').read_text()\n"
+        f"assert 'server_port: {port}' in pathlib.Path('config/configuration.yaml').read_text()\n"
         "pathlib.Path('setup.done').touch()\n"
     )
     script.chmod(0o755)
@@ -767,9 +772,17 @@ def test_confirmed_bootstrap_creates_config_sets_up_then_checks_imports(tmp_path
     monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
     monkeypatch.setattr(ws, "repository_jobs", lambda *args: [])
     monkeypatch.setattr(ws, "project_setup_jobs", lambda *args, **kwargs: [ws.Job("Core", core, (["script/setup"],))])
-    assert ws.run_bootstrap(tmp_path, "default", yes=True, argv=["bootstrap", "--yes"], environ={"XKNX_HA_PORT": "9123"}, progress_mode="quiet") == (1 if outside_import else 0)
+    fake_knx_build(tmp_path)
+    hass = core / ".venv/bin/hass"
+    hass.write_text(
+        f"#!{sys.executable}\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\n"
+        f"HTTPServer(('127.0.0.1', {port}), type('Handler', (BaseHTTPRequestHandler,), {{'do_GET': lambda self: (self.send_response(401), self.end_headers())}})).serve_forever()\n"
+    )
+    hass.chmod(0o755)
+    monkeypatch.setattr(ws, "tmux_status", lambda: {"session": "xknx-dev", "running": False, "windows": []})
+    assert ws.run_bootstrap(tmp_path, "default", yes=True, argv=["bootstrap", "--yes"], environ={"XKNX_HA_PORT": str(port)}, progress_mode="quiet") == (1 if outside_import else 0)
     assert (tmp_path / "wiring.done").exists()
-    assert len(list((tmp_path / ".state/logs").glob("*.log"))) == 2
+    assert len(list((tmp_path / ".state/logs").glob("*.log"))) == (2 if outside_import else 3)
 
 
 @pytest.mark.parametrize("with_yaml", [False, True])
@@ -1032,3 +1045,293 @@ def test_tmux_failure_wrapper_runs_portably_from_supported_login_shells(
 
     assert result.returncode == 0
     assert result.stdout == "\nProcess exited with status 7.\n"
+
+
+@pytest.fixture
+def ha_http_server():
+    class Handler(BaseHTTPRequestHandler):
+        status = 200
+
+        def do_GET(self):
+            self.send_response(self.status)
+            if self.status == 302:
+                self.send_header("Location", "/redirect-loop")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server, Handler
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def fake_knx_build(root: Path) -> None:
+    for name in ("constants.py", "frontend_latest/manifest.json", "frontend_es5/manifest.json"):
+        artifact = root / "knx-frontend/knx_frontend" / name
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text("{}")
+
+
+@pytest.mark.parametrize("http_code", [200, 302, 401, 500])
+def test_default_smoke_with_local_http_and_local_ha_imports(tmp_path: Path, monkeypatch, ha_http_server, http_code: int) -> None:
+    server, handler = ha_http_server
+    handler.status = http_code
+    fake_ha_packages(tmp_path)
+    fake_knx_build(tmp_path)
+    events, _ = fake_tmux(tmp_path, monkeypatch)
+    settings = ws.load_settings(tmp_path, {"XKNX_HA_PORT": str(server.server_port)})
+    result = ws.check_default_smoke(tmp_path, settings)
+    assert (result["status"] == "passed") is (http_code != 500)
+    assert result["checks"]["home-assistant"]["http_code"] == http_code
+    assert result["checks"]["packages"]["ok"]
+    assert result["checks"]["knx-frontend"]["ok"]
+    assert result["checks"]["tmux"]["state"] == "actionable"
+    assert "./dev start default" in result["checks"]["tmux"]["detail"]
+    assert all(call[0] in {"has-session", "list-windows"} for call in tmux_events(events))
+
+
+def test_smoke_names_package_frontend_and_pane_failures(tmp_path: Path, monkeypatch, ha_http_server) -> None:
+    server, _ = ha_http_server
+    paths = fake_ha_packages(tmp_path)
+    Path(paths["xknx"]).unlink()
+    events, state = fake_tmux(tmp_path, monkeypatch)
+    state.touch()
+    monkeypatch.setenv("FAKE_TMUX_WINDOWS", "overview\t0\tzsh\t\nhome-assistant\t0\tpython\t\nknx-frontend\t0\tzsh\t")
+    settings = ws.load_settings(tmp_path, {"XKNX_HA_PORT": str(server.server_port)})
+    result = ws.check_default_smoke(tmp_path, settings)
+    assert result["status"] == "failed"
+    assert "xknx" in result["checks"]["packages"]["detail"]
+    assert not result["checks"]["knx-frontend"]["ok"]
+    assert "knx-frontend" in result["checks"]["knx-frontend"]["detail"]
+    assert "knx-frontend" in result["checks"]["tmux"]["detail"]
+    monkeypatch.setenv("FAKE_TMUX_WINDOWS", "overview\t0\tzsh\t\nhome-assistant\t0\tpython\t\nknx-frontend\t0\tnode\t")
+    assert ws.check_default_smoke(tmp_path, settings)["checks"]["knx-frontend"]["ok"]
+    assert all(call[0] in {"has-session", "list-windows"} for call in tmux_events(events))
+
+
+def test_collected_status_reads_git_from_disk_without_fetching_or_writing(tmp_path: Path, monkeypatch) -> None:
+    _, upstream, checkout = create_checkout(tmp_path)
+    old_remote = git("-C", checkout, "rev-parse", "origin/trunk").stdout
+    commit(upstream, "remote change", "remote.txt")
+    git("-C", upstream, "push")
+    (checkout / "local.txt").write_text("developer change")
+    fake_planning_tools(monkeypatch)
+    events, _ = fake_tmux(tmp_path, monkeypatch)
+    before = {str(path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    status = ws.collect_status(tmp_path, ws.load_settings(tmp_path, {}))
+    assert status["repositories"]["xknx"]["dirty"] is True
+    assert status["repositories"]["xknx"]["behind"] == 0
+    assert status["repositories"]["xknx"]["action"] == "observed"
+    assert git("-C", checkout, "rev-parse", "origin/trunk").stdout == old_remote
+    after = {str(path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file() and path != events}
+    assert after == before
+    assert all(call[0] in {"has-session", "list-windows"} for call in tmux_events(events))
+    lines = []
+    ws.render_status(status, "human", lines.append)
+    assert "xknx" in "\n".join(lines) and "dirty" in "\n".join(lines)
+    lines.clear()
+    ws.render_status(status, "json", lines.append)
+    assert len(lines) == 1 and json.loads(lines[0]) == status
+
+
+def temporary_smoke_plan(tmp_path: Path, monkeypatch, body: str) -> dict:
+    fake_ha_packages(tmp_path)
+    fake_knx_build(tmp_path)
+    fake_tmux(tmp_path, monkeypatch)
+    with ws.socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    settings = ws.load_settings(tmp_path, {"XKNX_HA_PORT": str(port)})
+    child = tmp_path / "home-assistant-core/.venv/bin/hass"
+    child.write_text(
+        f"#!{sys.executable}\nimport os, signal, time\nfrom pathlib import Path\n"
+        f"Path({str(tmp_path / 'child.pid')!r}).write_text(str(os.getpid()))\n"
+        f"port = {port}\n" + body
+    )
+    child.chmod(0o755)
+    return {"root": tmp_path, "settings": settings, "profile": "default", "smoke_default": ws.smoke_default}
+
+
+@pytest.mark.parametrize(("body", "expected"), [
+    ("from http.server import HTTPServer, BaseHTTPRequestHandler\nHTTPServer(('127.0.0.1', port), type('Handler', (BaseHTTPRequestHandler,), {'do_GET': lambda self: (self.send_response(401), self.end_headers())})).serve_forever()\n", 0),
+    ("raise SystemExit(7)\n", 7),
+    ("signal.signal(signal.SIGINT, signal.SIG_IGN)\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(30)\n", 1),
+])
+def test_bootstrap_smoke_always_reaps_its_foreground_child(tmp_path: Path, monkeypatch, capsys, body: str, expected: int) -> None:
+    plan = temporary_smoke_plan(tmp_path, monkeypatch, body)
+    assert asyncio.run(ws.smoke_default(plan, ws.Progress("json", log_dir=tmp_path / "logs"), timeout=0.4)) == expected
+    pid = int((tmp_path / "child.pid").read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    assert plan["smoke"]["default"]["acceptance_satisfied"] is (expected == 0)
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert any("temporary" in event["detail"].lower() for event in events)
+    assert any("log:" in event["detail"] for event in events)
+    log = next((tmp_path / "logs").glob("*.log")).read_text()
+    assert f'"acceptance_satisfied": {str(expected == 0).lower()}' in log
+
+
+def test_bootstrap_smoke_cancellation_reaps_child(tmp_path: Path, monkeypatch) -> None:
+    plan = temporary_smoke_plan(tmp_path, monkeypatch, "time.sleep(30)\n")
+
+    async def exercise():
+        task = asyncio.create_task(ws.smoke_default(plan, ws.Progress("quiet", log_dir=tmp_path / "logs")))
+        for _ in range(100):
+            if (tmp_path / "child.pid").exists():
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+    with pytest.raises(ProcessLookupError):
+        os.kill(int((tmp_path / "child.pid").read_text()), 0)
+
+
+def test_bootstrap_smoke_reuses_existing_tmux_ha_without_signalling_it(tmp_path: Path, monkeypatch, ha_http_server) -> None:
+    server, _ = ha_http_server
+    fake_ha_packages(tmp_path)
+    fake_knx_build(tmp_path)
+    events, state = fake_tmux(tmp_path, monkeypatch)
+    state.touch()
+    monkeypatch.setenv("FAKE_TMUX_WINDOWS", "overview\t0\tzsh\t\nhome-assistant\t0\tpython\t\nknx-frontend\t0\tnode\t\ntoolkit\t0\tpython\t")
+    settings = ws.load_settings(tmp_path, {"XKNX_HA_PORT": str(server.server_port)})
+    plan = {"root": tmp_path, "settings": settings, "profile": "toolkit"}
+    assert asyncio.run(ws.smoke_default(plan, ws.Progress("quiet", log_dir=tmp_path / "logs"))) == 0
+    assert plan["smoke"]["toolkit"]["status"] == "skipped"
+    assert plan["smoke"]["toolkit"]["acceptance_satisfied"] is False
+    assert state.exists() and server.fileno() != -1
+    assert all(call[0] in {"has-session", "list-windows"} for call in tmux_events(events))
+    monkeypatch.setenv("FAKE_TMUX_WINDOWS", "overview\t0\tzsh\t\nhome-assistant\t0\tpython\t\nknx-frontend\t0\tnode\t")
+    assert asyncio.run(ws.smoke_default(plan, ws.Progress("quiet", log_dir=tmp_path / "logs"))) == 1
+    assert "toolkit" in plan["smoke"]["default"]["checks"]["tmux"]["detail"]
+
+
+def test_bootstrap_plans_foreground_smoke_and_build_artifact_before_execution(tmp_path: Path, monkeypatch, capsys) -> None:
+    fake_planning_tools(monkeypatch)
+    observed = {}
+
+    async def capture(plan, progress):
+        observed.update(plan)
+        return 0
+
+    monkeypatch.setattr(ws, "bootstrap_workspace", capture)
+    assert ws.run_bootstrap(tmp_path, "default", yes=True, argv=["bootstrap", "--yes"], environ={}) == 0
+    output = capsys.readouterr().out
+    assert "script/build" in output and "temporary foreground" in output and "terminate" in output
+    assert observed["smoke_default"] is ws.smoke_default
+    assert observed["expected_artifacts"]["KNX Frontend"]
+    assert all("knx_frontend" in str(path) for path in observed["expected_artifacts"]["KNX Frontend"])
+
+
+def test_bootstrap_reuses_occupied_port_only_for_running_ha_pane(tmp_path: Path, monkeypatch, ha_http_server) -> None:
+    server, _ = ha_http_server
+    _, state = fake_tmux(tmp_path, monkeypatch)
+    state.touch()
+    monkeypatch.setenv("FAKE_TMUX_WINDOWS", "home-assistant\t0\tpython\t")
+    settings = ws.load_settings(tmp_path, {"XKNX_HA_PORT": str(server.server_port)})
+    assert ws.configuration_action(tmp_path, settings)["port"] == server.server_port
+    monkeypatch.setenv("FAKE_TMUX_WINDOWS", "home-assistant\t0\tzsh\t")
+    with pytest.raises(ValueError, match="XKNX_HA_PORT"):
+        ws.configuration_action(tmp_path, settings)
+
+
+def test_knx_setup_reruns_only_when_build_artifacts_are_missing(tmp_path: Path, monkeypatch) -> None:
+    fake_planning_tools(monkeypatch)
+    monkeypatch.setattr(ws, "nvm_shell", lambda command: command)
+    scripts = tmp_path / "knx-frontend/script"
+    scripts.mkdir(parents=True)
+    (scripts.parent / "node_modules").mkdir()
+    bootstrap = scripts / "bootstrap"
+    bootstrap.write_text("#!/bin/sh\nexit 0\n")
+    bootstrap.chmod(0o755)
+    build = scripts / "build"
+    build.write_text(
+        f"#!{sys.executable}\nfrom pathlib import Path\n"
+        "counter = Path('build-count')\ncounter.write_text(str(int(counter.read_text()) + 1) if counter.exists() else '1')\n"
+        "for name in ('__init__.py', 'constants.py', 'frontend_latest/manifest.json', 'frontend_es5/manifest.json'):\n"
+        "    path = Path('knx_frontend') / name\n    path.parent.mkdir(parents=True, exist_ok=True)\n    path.write_text('{}')\n"
+    )
+    build.chmod(0o755)
+    captured = {}
+
+    async def capture(plan, progress):
+        captured.update(plan)
+        return 0
+
+    controller = ws.bootstrap_workspace
+    monkeypatch.setattr(ws, "bootstrap_workspace", capture)
+    assert ws.run_bootstrap(tmp_path, "default", yes=True, argv=["bootstrap", "--yes"], environ={}) == 0
+    plan = {"root": tmp_path, "project_setup_jobs": [job for job in captured["project_setup_jobs"] if job.name == "KNX Frontend"], "expected_artifacts": captured["expected_artifacts"]}
+    progress = ws.Progress("quiet", log_dir=tmp_path / "logs")
+    assert asyncio.run(controller(plan, progress)) == 0
+    assert (scripts.parent / "build-count").read_text() == "1"
+    assert asyncio.run(controller(plan, progress)) == 0
+    assert (scripts.parent / "build-count").read_text() == "1"
+    (scripts.parent / "knx_frontend/frontend_latest/manifest.json").unlink()
+    assert asyncio.run(controller(plan, progress)) == 0
+    assert (scripts.parent / "build-count").read_text() == "2"
+
+
+def test_bootstrap_smoke_failure_code_reaches_summary(tmp_path: Path, monkeypatch, capsys) -> None:
+    plan = temporary_smoke_plan(tmp_path, monkeypatch, "raise SystemExit(7)\n")
+    assert asyncio.run(ws.bootstrap_workspace(plan, ws.Progress("json", log_dir=tmp_path / "logs"))) == 7
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert "exit code 7" in events[-1]["detail"]
+
+
+@pytest.mark.parametrize("python_available", [True, False])
+def test_status_launcher_uses_only_existing_interpreters_without_sync(tmp_path: Path, python_available: bool) -> None:
+    controller = tmp_path / ".workspace"
+    controller.mkdir()
+    (controller / "xknx_workspace.py").write_text((ws.ROOT / ".workspace/xknx_workspace.py").read_text())
+    launcher = tmp_path / "dev"
+    launcher.write_text((ws.ROOT / "dev").read_text())
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "dirname").symlink_to("/usr/bin/dirname")
+    python = bin_dir / "python3"
+    if python_available:
+        python.symlink_to(sys.executable)
+    else:
+        python.write_text("#!/bin/sh\nexit 1\n")
+        python.chmod(0o755)
+        interpreter = controller / ".venv/bin/python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.symlink_to(sys.executable)
+    uv = bin_dir / "uv"
+    uv.write_text(
+        f"#!{sys.executable}\nimport os, sys\n"
+        "if sys.argv[1:] == ['--version']: print('uv 0.11.0'); raise SystemExit(0)\n"
+        f"assert {not python_available!r}, 'uv must not run when compatible python3 exists'\n"
+        "assert {'--locked', '--no-sync', '--offline', '--no-python-downloads'} <= set(sys.argv)\n"
+        "assert os.environ['UV_PROJECT_ENVIRONMENT'] == sys.argv[sys.argv.index('--project') + 1] + '/.venv'\n"
+        "index = sys.argv.index('--no-python-downloads') + 1\n"
+        "os.execv(sys.argv[index], sys.argv[index:])\n"
+    )
+    uv.chmod(0o755)
+    before = sorted(str(path) for path in tmp_path.rglob("*"))
+    result = subprocess.run(["/bin/sh", str(launcher), "status", "--format", "json"], env={"PATH": str(bin_dir), "NVM_DIR": str(tmp_path / "missing-nvm"), "UV_PROJECT_ENVIRONMENT": str(tmp_path / "unrelated")}, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["profile"] == "default"
+    assert sorted(str(path) for path in tmp_path.rglob("*")) == before
+
+
+def test_status_launcher_without_python_or_environment_gives_actionable_error(tmp_path: Path) -> None:
+    launcher = tmp_path / "dev"
+    launcher.write_text((ws.ROOT / "dev").read_text())
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "dirname").symlink_to("/usr/bin/dirname")
+    result = subprocess.run(["/bin/sh", str(launcher), "status", "--format", "json"], env={"PATH": str(bin_dir)}, capture_output=True, text=True, check=False)
+    assert result.returncode == 2
+    assert "bootstrap" in result.stderr
+    assert not (tmp_path / ".workspace").exists()
