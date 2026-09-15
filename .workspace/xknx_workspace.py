@@ -461,8 +461,11 @@ async def bootstrap_workspace(plan: dict[str, object], progress: Progress) -> in
             return code
         if wire := plan.get("wire_home_assistant"):
             pending_callbacks.remove("wire_home_assistant")
-            if not await wire(plan, progress):
-                return 1
+            result = await wire(plan, progress)
+            wire_code = int(not result) if isinstance(result, bool) else result
+            if wire_code:
+                code = wire_code
+                return code
         if smoke := plan.get("smoke_default"):
             pending_callbacks.remove("smoke_default")
             if not await smoke(plan, progress):
@@ -666,15 +669,10 @@ def home_assistant_command(root: Path, settings: Mapping[str, object]) -> list[s
 
 
 def configuration_action(root: Path, settings: Mapping[str, object]) -> dict[str, object]:
+    validate_settings_schema(settings)
     root = root.resolve()
     ha = {**DEFAULTS["home_assistant"], **settings.get("home_assistant", {})}
     knx = {**DEFAULTS["knx"], **settings.get("knx", {})}
-    if set(ha) - {"port", "config_dir"}:
-        raise ValueError("home_assistant accepts only port and config_dir; move secret material to a local file")
-    if set(knx) - {"mode", "secure_config_path"}:
-        raise ValueError("knx accepts only mode and secure_config_path; move secret material to a local file")
-    if not isinstance(knx["mode"], str) or knx["mode"] not in {"automatic", "real"}:
-        raise ValueError("knx.mode / XKNX_KNX_MODE must be automatic or real")
     secure = knx.get("secure_config_path")
     if knx["mode"] == "real" or secure is not None:
         if not isinstance(secure, str) or not secure:
@@ -683,8 +681,6 @@ def configuration_action(root: Path, settings: Mapping[str, object]) -> dict[str
         if not secure.is_file() or not os.access(secure, os.R_OK):
             raise ValueError("knx.secure_config_path must reference a readable local file")
     port = ha["port"]
-    if type(port) is not int or not 1 <= port <= 65535:
-        raise ValueError("home_assistant.port / XKNX_HA_PORT must be an integer in 1..65535")
     for family, host in ((socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")):
         try:
             with socket.socket(family) as probe:
@@ -694,8 +690,6 @@ def configuration_action(root: Path, settings: Mapping[str, object]) -> dict[str
                 continue
             raise ValueError(f"home_assistant.port {port} is unavailable; set XKNX_HA_PORT to a free port") from error
     raw_path = ha["config_dir"]
-    if not isinstance(raw_path, str) or not raw_path.strip():
-        raise ValueError("home_assistant.config_dir / XKNX_HA_CONFIG_DIR must be a directory path")
     config_dir = (root / raw_path).resolve()
     if not Path(raw_path).is_absolute() and not config_dir.is_relative_to(root):
         raise ValueError("home_assistant.config_dir must stay inside the workspace; select an explicit absolute path with XKNX_HA_CONFIG_DIR")
@@ -709,6 +703,7 @@ def configuration_action(root: Path, settings: Mapping[str, object]) -> dict[str
         "kind": "configuration", "path": str(local), "action": "reuse" if local.exists() else "create",
         "sha256": hashlib.sha256(local.read_bytes()).hexdigest() if local.exists() else None,
         "config_dir": str(config_dir), "reuse_config": config_dir.exists(),
+        "setup_config_exists": (root / "home-assistant-core/config").exists(),
         "explicit_config": Path(raw_path).is_absolute() or raw_path != DEFAULTS["home_assistant"]["config_dir"],
         "port": port, "knx_mode": knx["mode"], "secure_config_path": str(secure) if secure else None,
     }
@@ -725,13 +720,17 @@ def create_home_assistant_configuration(action: Mapping[str, object]) -> None:
     if action["reuse_config"]:
         return
     directory = Path(action["config_dir"])
-    if directory.resolve() != directory:
+    setup_config = Path(action["path"]).parent / "home-assistant-core/config"
+    if directory.resolve() != directory or directory.exists() or (
+        not action["setup_config_exists"] and (setup_config.exists() or setup_config.is_symlink())
+    ):
         raise ValueError("home_assistant.config_dir changed after confirmation; review bootstrap again")
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / "configuration.yaml"
-    if not path.exists():
-        with path.open("x") as config:
+    try:
+        directory.mkdir(parents=True)
+        with (directory / "configuration.yaml").open("x") as config:
             config.write(f"default_config:\nhttp:\n  server_port: {action['port']}\n")
+    except FileExistsError:
+        raise ValueError("home_assistant.config_dir changed after confirmation; review bootstrap again") from None
 
 
 LOCAL_PACKAGES = {
@@ -780,13 +779,13 @@ def package_status(root: Path, runner=subprocess.run) -> dict[str, dict[str, obj
     return status
 
 
-async def wire_home_assistant(plan: Mapping[str, object], progress: Progress) -> bool:
+async def wire_home_assistant(plan: Mapping[str, object], progress: Progress) -> int:
     root = plan["root"]
     result = await run_job(
         Job("Home Assistant editable packages", root, (home_assistant_wiring_command(root), home_assistant_import_command(root))),
         progress, command_runner=plan.get("command_runner"),
     )
-    return result.returncode == 0
+    return result.returncode
 
 
 def docker_status(platform: str, executable: str | None, daemon_reachable: bool) -> dict[str, object]:
@@ -921,6 +920,7 @@ def build_bootstrap_plan(
     *,
     enforce_tool_versions: bool = False,
 ) -> list[dict[str, object]]:
+    validate_settings_schema(settings)
     repositories = repositories_for(profile)
     platform = detect_platform()
     if platform not in PACKAGE_COMMANDS:
@@ -1324,15 +1324,36 @@ def repository_row(status: Mapping[str, object]) -> str:
     )
 
 
+def validate_settings_schema(settings: Mapping[str, object]) -> None:
+    if set(settings) - {"profile", "home_assistant", "knx"}:
+        raise ValueError("root configuration accepts only profile, home_assistant, and knx")
+    profile = settings.get("profile", DEFAULTS["profile"])
+    if not isinstance(profile, str) or profile not in PROFILES:
+        raise ValueError("profile must be one of: " + ", ".join(PROFILES))
+    for section, keys in (("home_assistant", {"port", "config_dir"}), ("knx", {"mode", "secure_config_path"})):
+        values = settings.get(section, {})
+        if not isinstance(values, dict):
+            raise ValueError(f"{section} must be a TOML table")
+        if set(values) - keys:
+            raise ValueError(f"{section} accepts only " + ", ".join(sorted(keys)))
+        for key, value in values.items():
+            if key == "port":
+                if type(value) is not int or not 1 <= value <= 65535:
+                    raise ValueError("home_assistant.port / XKNX_HA_PORT must be an integer in 1..65535")
+            elif not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{section}.{key} must be a nonempty string")
+            elif key == "mode" and value not in {"automatic", "real"}:
+                raise ValueError("knx.mode / XKNX_KNX_MODE must be automatic or real")
+
+
 def load_settings(root: Path = ROOT, environ: Mapping[str, str] = os.environ) -> dict[str, object]:
     settings = {"profile": DEFAULTS["profile"], "home_assistant": dict(DEFAULTS["home_assistant"]), "knx": dict(DEFAULTS["knx"])}
     path = root / ".xknx-dev.toml"
     if path.exists():
         loaded = tomllib.loads(path.read_text())
+        validate_settings_schema(loaded)
         settings["profile"] = loaded.get("profile", settings["profile"])
         for section in ("home_assistant", "knx"):
-            if not isinstance(loaded.get(section, {}), dict):
-                raise ValueError(f"{section} must be a TOML table")
             settings[section].update(loaded.get(section, {}))
     if port := environ.get("XKNX_HA_PORT"):
         try:
@@ -1343,6 +1364,7 @@ def load_settings(root: Path = ROOT, environ: Mapping[str, str] = os.environ) ->
         settings["home_assistant"]["config_dir"] = config_dir
     if mode := environ.get("XKNX_KNX_MODE"):
         settings["knx"]["mode"] = mode
+    validate_settings_schema(settings)
     return settings
 
 

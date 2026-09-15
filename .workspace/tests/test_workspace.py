@@ -988,3 +988,38 @@ def test_invalid_setting_types_report_the_exact_key_without_echoing_values(tmp_p
     settings = {"knx": {"mode": []}}
     with pytest.raises(ValueError, match="knx.mode"):
         ws.configuration_action(tmp_path, settings)
+
+
+@pytest.mark.parametrize(("content", "key"), [
+    ('profile = true\n', 'profile'),
+    ('profile = []\n', 'profile'),
+    ('home_assistant = []\n', 'home_assistant'),
+    ('[home_assistant]\npassword = "private-marker"\n', 'home_assistant'),
+    ('[home_assistant]\nport = "private-marker"\n', 'home_assistant.port'),
+    ('[home_assistant]\nport = true\n', 'home_assistant.port'),
+    ('[home_assistant]\nconfig_dir = []\n', 'home_assistant.config_dir'),
+    ('[knx]\npassword = "private-marker"\n', 'knx'),
+    ('[knx]\nmode = []\n', 'knx.mode'),
+    ('[knx]\nsecure_config_path = true\n', 'knx.secure_config_path'),
+])
+def test_load_settings_rejects_unknown_section_keys_and_wrong_types(tmp_path: Path, content: str, key: str) -> None:
+    (tmp_path / ".xknx-dev.toml").write_text(content)
+    with pytest.raises(ValueError, match=key) as error:
+        ws.load_settings(tmp_path, {})
+    assert "private-marker" not in str(error.value)
+
+
+def test_yaml_appearing_during_config_creation_requires_a_new_plan(tmp_path: Path, monkeypatch) -> None:
+    action = ws.configuration_action(tmp_path, ws.load_settings(tmp_path, {}))
+    directory = Path(action["config_dir"])
+    mkdir = Path.mkdir
+
+    def raced_mkdir(path, *args, **kwargs):
+        mkdir(path, *args, **kwargs)
+        if path == directory:
+            (path / "configuration.yaml").write_text("developer-owned\n")
+
+    monkeypatch.setattr(Path, "mkdir", raced_mkdir)
+    with pytest.raises(ValueError, match="config_dir.*changed"):
+        ws.create_home_assistant_configuration(action)
+    assert (directory / "configuration.yaml").read_text() == "developer-owned\n"

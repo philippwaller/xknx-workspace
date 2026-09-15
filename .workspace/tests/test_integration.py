@@ -769,3 +769,66 @@ def test_confirmed_bootstrap_creates_config_sets_up_then_checks_imports(tmp_path
     assert ws.run_bootstrap(tmp_path, "default", yes=True, argv=["bootstrap", "--yes"], environ={"XKNX_HA_PORT": "9123"}, progress_mode="quiet") == (1 if outside_import else 0)
     assert (tmp_path / "wiring.done").exists()
     assert len(list((tmp_path / ".state/logs").glob("*.log"))) == 2
+
+
+@pytest.mark.parametrize("with_yaml", [False, True])
+@pytest.mark.parametrize("config_dir", ["home-assistant-core/config", "custom-config"])
+def test_config_appearing_during_checkout_stops_before_setup(tmp_path: Path, capsys, with_yaml: bool, config_dir: str) -> None:
+    settings = ws.load_settings(tmp_path, {"XKNX_HA_CONFIG_DIR": config_dir})
+    action = ws.configuration_action(tmp_path, settings)
+    (tmp_path / ".xknx-dev.example.toml").write_text((ws.ROOT / ".xknx-dev.example.toml").read_text())
+    checkout = ws.Job("checkout", tmp_path, ([sys.executable, "-c",
+        "from pathlib import Path; config = Path('home-assistant-core/config'); config.mkdir(parents=True); "
+        + ("(config / 'configuration.yaml').write_text('developer-owned\\n')" if with_yaml else ""),
+    ],))
+    plan = {
+        "root": tmp_path, "settings": settings, "configuration": action,
+        "repository_jobs": [checkout], "project_setup_jobs": ws.project_setup_jobs(tmp_path, "default"),
+    }
+    with pytest.raises(ValueError, match="config_dir.*changed"):
+        asyncio.run(ws.bootstrap_workspace(plan, ws.Progress("json", log_dir=tmp_path / "logs")))
+    config = tmp_path / "home-assistant-core/config"
+    assert list(config.iterdir()) == ([config / "configuration.yaml"] if with_yaml else [])
+    if with_yaml:
+        assert (config / "configuration.yaml").read_text() == "developer-owned\n"
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert not any(event["task"] == "Home Assistant Core" and event["status"] == "running" for event in events)
+    assert len(list((tmp_path / "logs").glob("*.log"))) == 1
+
+
+@pytest.mark.parametrize("content", [
+    'password = "private-config-marker"\n',
+    '[unknown]\npassword = "private-config-marker"\n',
+    '[profile]\npassword = "private-config-marker"\n',
+    'profile = "private-config-marker"\n',
+])
+def test_secret_bearing_invalid_root_config_never_reaches_plan_or_logs(tmp_path: Path, monkeypatch, capsys, content: str) -> None:
+    (tmp_path / ".xknx-dev.toml").write_text(content)
+    monkeypatch.setattr(ws, "ROOT", tmp_path)
+
+    def forbidden_plan(*args, **kwargs):
+        raise AssertionError("Invalid settings reached the plan builder")
+
+    monkeypatch.setattr(ws, "build_bootstrap_plan", forbidden_plan)
+    assert ws.main(["bootstrap", "--yes", "--progress", "json"]) == 2
+    output = capsys.readouterr()
+    assert "private-config-marker" not in output.out + output.err
+    assert "Error:" in output.err
+    assert not (tmp_path / ".state/logs").exists()
+
+
+@pytest.mark.parametrize("failure", [7, 127])
+def test_wiring_preserves_command_exit_code_and_skips_smoke(tmp_path: Path, monkeypatch, capsys, failure: int) -> None:
+    command = [sys.executable, "-c", "import sys; sys.exit(7)"] if failure == 7 else [str(tmp_path / "missing-uv")]
+    monkeypatch.setattr(ws, "home_assistant_wiring_command", lambda root: command)
+
+    async def forbidden_smoke(plan, progress):
+        raise AssertionError("Smoke must not run after wiring fails")
+
+    plan = {"root": tmp_path, "wire_home_assistant": ws.wire_home_assistant, "smoke_default": forbidden_smoke}
+    assert asyncio.run(ws.bootstrap_workspace(plan, ws.Progress("json", log_dir=tmp_path / "logs"))) == failure
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert f"exit code {failure}" in events[-1]["detail"]
+    assert any(event["task"] == "smoke_default" and event["status"] == "skipped" for event in events)
+    log = next((tmp_path / "logs").glob("*.log")).read_text()
+    assert f"returncode: {failure}" in log
