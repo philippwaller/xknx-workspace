@@ -1158,3 +1158,25 @@ def test_status_preserves_this_invocations_smoke_result(tmp_path: Path, monkeypa
     smoke = {"status": "completed", "default": {"status": "passed", "acceptance_satisfied": True}}
     status = ws.collect_status(tmp_path, ws.load_settings(tmp_path, {}), smoke=smoke)
     assert status["smoke"] == smoke
+
+
+@pytest.mark.parametrize("secret", ["false", "8123", "profile"])
+def test_status_redacts_string_values_without_changing_schema_or_scalar_types(tmp_path: Path, monkeypatch, capsys, secret: str) -> None:
+    monkeypatch.setattr(ws, "ROOT", tmp_path)
+    monkeypatch.setattr(ws, "inspect_tool", lambda name: {"installed": None, "executable": None})
+    monkeypatch.setattr(ws, "inspect_docker", lambda platform: ws.docker_status(platform, None, False))
+    monkeypatch.setenv("STATUS_TEST_SECRET", secret)
+    smoke = {"status": "completed", "profile": [secret, False, 8123, None, {"profile": secret}]}
+    status = ws.collect_status(tmp_path, ws.load_settings(tmp_path, {}), smoke=smoke)
+    assert set(status) == {"workspace", "profile", "platform", "configuration", "tools", "docker", "repositories", "packages", "processes", "smoke"}
+    assert status["configuration"]["effective"]["home_assistant"]["port"] == 8123
+    assert status["docker"]["required"] is False
+    assert status["smoke"]["profile"] == ["***", False, 8123, None, {"profile": "***"}]
+    assert smoke["profile"][0] == secret
+    ws.render_status(status, "json")
+    assert json.loads(capsys.readouterr().out) == status
+    assert ws.main(["dev", "status", "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["profile"] == "default"
+    monkeypatch.setattr(ws, "ensure_repository", lambda *args: {"error": None, "dirty": False, "ahead": 8123, "profile": secret})
+    assert ws.main(["_repository", str(tmp_path / "xknx"), "unused"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"error": None, "dirty": False, "ahead": 8123, "profile": "***"}

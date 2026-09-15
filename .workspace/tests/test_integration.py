@@ -922,7 +922,9 @@ def fake_tmux(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Pa
         "if command == 'new-session': state.touch()\n"
         "elif command == 'new-window' and sys.argv[sys.argv.index('-n') + 1] == os.environ.get('FAKE_TMUX_FAIL_WINDOW'):\n"
         "    raise SystemExit(int(os.environ['FAKE_TMUX_WINDOW_EXIT']))\n"
-        "elif command == 'list-windows': print(os.environ.get('FAKE_TMUX_WINDOWS', ''))\n"
+        "elif command == 'list-windows':\n"
+        "    for line in os.environ.get('FAKE_TMUX_WINDOWS', '').splitlines():\n"
+        "        fields = line.split('\\t')\n        print('\\t'.join(fields + [''] * (6 - len(fields))))\n"
         "elif command == 'kill-session':\n"
         "    if code := int(os.environ.get('FAKE_TMUX_KILL_EXIT', '0')): raise SystemExit(code)\n"
         "    state.unlink()\n"
@@ -936,6 +938,11 @@ def fake_tmux(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Pa
 
 def tmux_events(path: Path) -> list[list[str]]:
     return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def ha_tmux_line(root: Path, settings: dict) -> str:
+    start = shlex.quote(ws._tmux_process_shell(ws.home_assistant_command(root, settings["home_assistant"])))
+    return f"home-assistant\t0\tpython\t\t{start}\t{root / 'home-assistant-core'}"
 
 
 def test_existing_tmux_session_attaches_without_restarting_windows(tmp_path: Path, monkeypatch) -> None:
@@ -983,15 +990,15 @@ def test_new_tmux_session_creates_only_selected_visible_process_windows(tmp_path
 def test_tmux_status_is_read_only_and_stop_only_kills_an_existing_session(tmp_path: Path, monkeypatch, capsys) -> None:
     events, state = fake_tmux(tmp_path, monkeypatch)
     state.touch()
-    monkeypatch.setenv("FAKE_TMUX_WINDOWS", "overview\t0\tzsh\t\nhome-assistant\t1\tpython\t7")
+    monkeypatch.setenv("FAKE_TMUX_WINDOWS", "overview\t0\tzsh\t\t\t/tmp/workspace\nhome-assistant\t1\tpython\t7\thass --config /tmp/ha-config\t/tmp/workspace/home-assistant-core")
 
     status = ws.tmux_status()
     assert status == {
         "session": "xknx-dev",
         "running": True,
         "windows": [
-            {"name": "overview", "dead": False, "command": "zsh", "exit_code": None},
-            {"name": "home-assistant", "dead": True, "command": "python", "exit_code": 7},
+            {"name": "overview", "dead": False, "command": "zsh", "exit_code": None, "start_command": "", "cwd": "/tmp/workspace"},
+            {"name": "home-assistant", "dead": True, "command": "python", "exit_code": 7, "start_command": "hass --config /tmp/ha-config", "cwd": "/tmp/workspace/home-assistant-core"},
         ],
     }
     assert ws.stop_tmux() == 0
@@ -999,7 +1006,7 @@ def test_tmux_status_is_read_only_and_stop_only_kills_an_existing_session(tmp_pa
     assert ws.stop_tmux() == 0
     assert tmux_events(events) == [
         ["has-session", "-t", "=xknx-dev"],
-        ["list-windows", "-t", "=xknx-dev", "-F", "#{window_name}\t#{pane_dead}\t#{pane_current_command}\t#{pane_dead_status}"],
+        ["list-windows", "-t", "=xknx-dev", "-F", "#{window_name}\t#{pane_dead}\t#{pane_current_command}\t#{pane_dead_status}\t#{pane_start_command}\t#{pane_current_path}"],
         ["has-session", "-t", "=xknx-dev"],
         ["kill-session", "-t", "=xknx-dev"],
         ["has-session", "-t", "=xknx-dev"],
@@ -1202,15 +1209,16 @@ def test_bootstrap_smoke_reuses_existing_tmux_ha_without_signalling_it(tmp_path:
     fake_knx_build(tmp_path)
     events, state = fake_tmux(tmp_path, monkeypatch)
     state.touch()
-    monkeypatch.setenv("FAKE_TMUX_WINDOWS", "overview\t0\tzsh\t\nhome-assistant\t0\tpython\t\nknx-frontend\t0\tnode\t\ntoolkit\t0\tpython\t")
     settings = ws.load_settings(tmp_path, {"XKNX_HA_PORT": str(server.server_port)})
+    ha_window = ha_tmux_line(tmp_path, settings)
+    monkeypatch.setenv("FAKE_TMUX_WINDOWS", f"overview\t0\tzsh\t\n{ha_window}\nknx-frontend\t0\tnode\t\ntoolkit\t0\tpython\t")
     plan = {"root": tmp_path, "settings": settings, "profile": "toolkit"}
     assert asyncio.run(ws.smoke_default(plan, ws.Progress("quiet", log_dir=tmp_path / "logs"))) == 0
     assert plan["smoke"]["toolkit"]["status"] == "skipped"
     assert plan["smoke"]["toolkit"]["acceptance_satisfied"] is False
     assert state.exists() and server.fileno() != -1
     assert all(call[0] in {"has-session", "list-windows"} for call in tmux_events(events))
-    monkeypatch.setenv("FAKE_TMUX_WINDOWS", "overview\t0\tzsh\t\nhome-assistant\t0\tpython\t\nknx-frontend\t0\tnode\t")
+    monkeypatch.setenv("FAKE_TMUX_WINDOWS", f"overview\t0\tzsh\t\n{ha_window}\nknx-frontend\t0\tnode\t")
     assert asyncio.run(ws.smoke_default(plan, ws.Progress("quiet", log_dir=tmp_path / "logs"))) == 1
     assert "toolkit" in plan["smoke"]["default"]["checks"]["tmux"]["detail"]
 
@@ -1236,8 +1244,8 @@ def test_bootstrap_reuses_occupied_port_only_for_running_ha_pane(tmp_path: Path,
     server, _ = ha_http_server
     _, state = fake_tmux(tmp_path, monkeypatch)
     state.touch()
-    monkeypatch.setenv("FAKE_TMUX_WINDOWS", "home-assistant\t0\tpython\t")
     settings = ws.load_settings(tmp_path, {"XKNX_HA_PORT": str(server.server_port)})
+    monkeypatch.setenv("FAKE_TMUX_WINDOWS", ha_tmux_line(tmp_path, settings))
     assert ws.configuration_action(tmp_path, settings)["port"] == server.server_port
     monkeypatch.setenv("FAKE_TMUX_WINDOWS", "home-assistant\t0\tzsh\t")
     with pytest.raises(ValueError, match="XKNX_HA_PORT"):
@@ -1335,3 +1343,94 @@ def test_status_launcher_without_python_or_environment_gives_actionable_error(tm
     assert result.returncode == 2
     assert "bootstrap" in result.stderr
     assert not (tmp_path / ".workspace").exists()
+
+
+def test_malformed_http_response_is_an_actionable_check_and_valid_status_json(tmp_path: Path, monkeypatch, capsys, ha_http_server) -> None:
+    server, handler = ha_http_server
+    handler.do_GET = lambda self: self.wfile.write(b"NOT HTTP\r\n\r\n")
+    settings = ws.load_settings(tmp_path, {"XKNX_HA_PORT": str(server.server_port)})
+    check = ws.home_assistant_http(settings)
+    assert check["ok"] is False and check["http_code"] is None
+    assert "home-assistant" in check["detail"] and "XKNX_HA_PORT" in check["detail"]
+    fake_planning_tools(monkeypatch)
+    monkeypatch.setattr(ws, "ROOT", tmp_path)
+    monkeypatch.setenv("XKNX_HA_PORT", str(server.server_port))
+    assert ws.main(["dev", "status", "--format", "json"]) == 0
+    output = capsys.readouterr()
+    assert json.loads(output.out)["configuration"]["home_assistant"]["ok"] is False
+    assert "Traceback" not in output.out + output.err
+
+
+def test_bootstrap_malformed_http_response_fails_and_reaps_child(tmp_path: Path, monkeypatch, capsys) -> None:
+    plan = temporary_smoke_plan(tmp_path, monkeypatch,
+        "from http.server import HTTPServer, BaseHTTPRequestHandler\n"
+        f"HTTPServer(('127.0.0.1', port), type('Handler', (BaseHTTPRequestHandler,), {{'do_GET': lambda self: (Path({str(tmp_path / 'bad-http-served')!r}).touch(), self.wfile.write(b'NOT HTTP\\r\\n\\r\\n'))}})).serve_forever()\n",
+    )
+
+    async def smoke(plan, progress):
+        return await ws.smoke_default(plan, progress, timeout=2)
+
+    plan["smoke_default"] = smoke
+    assert asyncio.run(ws.bootstrap_workspace(plan, ws.Progress("json", log_dir=tmp_path / "logs"))) == 1
+    assert plan["smoke"]["default"]["checks"]["home-assistant"]["ok"] is False
+    assert (tmp_path / "bad-http-served").exists()
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert "exit code 1" in events[-1]["detail"]
+    with pytest.raises(ProcessLookupError):
+        os.kill(int((tmp_path / "child.pid").read_text()), 0)
+
+
+def test_unrelated_tmux_command_with_http_200_is_not_reusable_ha(tmp_path: Path, monkeypatch, capsys, ha_http_server) -> None:
+    server, _ = ha_http_server
+    fake_ha_packages(tmp_path)
+    fake_knx_build(tmp_path)
+    events, state = fake_tmux(tmp_path, monkeypatch)
+    state.touch()
+    monkeypatch.setenv("FAKE_TMUX_WINDOWS", "overview\t0\tzsh\t\nhome-assistant\t0\tsleep\t\nknx-frontend\t0\tnode\t")
+    settings = ws.load_settings(tmp_path, {"XKNX_HA_PORT": str(server.server_port)})
+    with pytest.raises(ValueError, match="XKNX_HA_PORT"):
+        ws.configuration_action(tmp_path, settings)
+    plan = {"root": tmp_path, "settings": settings, "profile": "default"}
+    assert asyncio.run(ws.smoke_default(plan, ws.Progress("json", log_dir=tmp_path / "logs"))) == 1
+    assert plan["smoke"]["default"]["acceptance_satisfied"] is False
+    assert "Reusing" not in capsys.readouterr().out
+    assert state.exists() and server.fileno() != -1
+    assert all(call[0] in {"has-session", "list-windows"} for call in tmux_events(events))
+
+
+@pytest.mark.parametrize("launch", ["direct", "wrapped", "tmux-quoted", "other-workspace", "other-config", "unrelated", "replaced-process"])
+def test_ha_pane_identity_matches_executable_and_resolved_config(tmp_path: Path, monkeypatch, ha_http_server, launch: str) -> None:
+    root = tmp_path / "workspace with spaces"
+    root.mkdir()
+    server, _ = ha_http_server
+    fake_ha_packages(root)
+    fake_knx_build(root)
+    fake_planning_tools(monkeypatch)
+    settings = ws.load_settings(root, {"XKNX_HA_PORT": str(server.server_port), "XKNX_HA_CONFIG_DIR": "custom config"})
+    command = [str(root / "home-assistant-core/.venv/bin/hass"), "--config", str(root / "custom config"), "--skip-pip-packages", "xknx,xknxproject,knx-frontend,knx-telegram-store"]
+    if launch == "other-workspace":
+        command[0] = str(tmp_path / "other/home-assistant-core/.venv/bin/hass")
+    elif launch == "other-config":
+        command[2] = str(root / "different config")
+    elif launch == "unrelated":
+        command = ["sleep", "10000"]
+    start = shlex.join(command) if launch == "direct" else ws._tmux_process_shell(command)
+    if launch == "tmux-quoted":
+        start = shlex.quote(start)
+    window = {"name": "home-assistant", "dead": False, "command": "sleep" if launch == "replaced-process" else "python3.14", "exit_code": None, "start_command": start, "cwd": str(root / "home-assistant-core")}
+    monkeypatch.setattr(ws, "tmux_status", lambda: {"session": "xknx-dev", "running": True, "windows": [
+        {"name": "overview", "dead": False, "command": "zsh", "exit_code": None}, window,
+        {"name": "knx-frontend", "dead": False, "command": "node", "exit_code": None},
+    ]})
+    matches = launch in {"direct", "wrapped", "tmux-quoted"}
+    status = ws.collect_status(root, settings)
+    assert (status["processes"]["expected"]["home-assistant"]["state"] == "running") is matches
+    assert status["processes"]["windows"][1]["start_command"] == start
+    assert status["processes"]["windows"][1]["cwd"] == str(root / "home-assistant-core")
+    if matches:
+        assert ws.configuration_action(root, settings)["port"] == server.server_port
+    else:
+        with pytest.raises(ValueError, match="XKNX_HA_PORT"):
+            ws.configuration_action(root, settings)
+    plan = {"root": root, "settings": settings, "profile": "default"}
+    assert asyncio.run(ws.smoke_default(plan, ws.Progress("quiet", log_dir=root / "logs"))) == (0 if matches else 1)

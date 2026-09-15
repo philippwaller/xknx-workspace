@@ -21,6 +21,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from http.client import HTTPException
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -96,7 +97,7 @@ CONFIRMED_PLAN_DIGEST_ENV = "XKNX_WORKSPACE_CONFIRMED_PLAN_SHA256"
 NVM_RELEASE_API = "https://api.github.com/repos/nvm-sh/nvm/releases/latest"
 TMUX_SESSION = "xknx-dev"
 TMUX_TARGET = f"={TMUX_SESSION}"
-TMUX_STATUS_FORMAT = "#{window_name}\t#{pane_dead}\t#{pane_current_command}\t#{pane_dead_status}"
+TMUX_STATUS_FORMAT = "#{window_name}\t#{pane_dead}\t#{pane_current_command}\t#{pane_dead_status}\t#{pane_start_command}\t#{pane_current_path}"
 KNX_FRONTEND_ARTIFACTS = (
     "knx-frontend/knx_frontend/__init__.py", "knx-frontend/knx_frontend/constants.py",
     "knx-frontend/knx_frontend/frontend_latest/manifest.json",
@@ -133,6 +134,16 @@ def redact(text: str, secrets: set[str]) -> str:
             text = text.replace(json.dumps(form)[1:-1], "***")
             text = text.replace(form, "***")
     return text
+
+
+def redact_structure(value: object, secrets: set[str]) -> object:
+    if isinstance(value, str):
+        return redact(value, secrets)
+    if isinstance(value, dict):
+        return {key: redact_structure(item, secrets) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(redact_structure(item, secrets) for item in value)
+    return value
 
 
 def display_command(command: Sequence[str], secrets: set[str] | None = None) -> str:
@@ -773,12 +784,14 @@ def tmux_status(runner=subprocess.run) -> dict[str, object]:
         return {"session": TMUX_SESSION, "running": False, "windows": [], "error": result.stderr.strip()}
     windows = []
     for line in result.stdout.splitlines():
-        name, dead, command, exit_code = line.split("\t", 3)
+        name, dead, command, exit_code, start_command, cwd = line.split("\t", 5)
         windows.append({
             "name": name,
             "dead": dead == "1",
             "command": command,
             "exit_code": int(exit_code) if exit_code else None,
+            "start_command": start_command,
+            "cwd": cwd,
         })
     return {"session": TMUX_SESSION, "running": True, "windows": windows}
 
@@ -826,7 +839,7 @@ def configuration_action(root: Path, settings: Mapping[str, object]) -> dict[str
             if family == socket.AF_INET6 and error.errno in {errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL, errno.EPROTONOSUPPORT}:
                 continue
             if error.errno == errno.EADDRINUSE:
-                processes = process_status(settings.get("profile", "default"))
+                processes = process_status(settings.get("profile", "default"), root=root, settings=settings)
                 if processes["expected"]["home-assistant"]["state"] == "running" and home_assistant_http({"home_assistant": ha})["ok"]:
                     continue
             raise ValueError(f"home_assistant.port {port} is unavailable; set XKNX_HA_PORT to a free port") from error
@@ -916,7 +929,21 @@ def package_status(root: Path, runner=subprocess.run) -> dict[str, dict[str, obj
     return status
 
 
-def process_status(profile: str) -> dict[str, object]:
+def _home_assistant_pane_matches(window: Mapping[str, object], root: Path, settings: Mapping[str, object]) -> bool:
+    if not re.fullmatch(r"hass|python(?:\d+(?:\.\d+)*)?", Path(window["command"]).name):
+        return False
+    command = home_assistant_command(root, {**DEFAULTS["home_assistant"], **settings.get("home_assistant", {})})
+    try:
+        started = shlex.split(window.get("start_command", ""))
+        # tmux quotes a single shell-command argument when formatting its argv.
+        if len(started) == 1:
+            started = shlex.split(started[0])
+    except ValueError:
+        return False
+    return started == command or started == shlex.split(_tmux_process_shell(command))
+
+
+def process_status(profile: str, *, root: Path = ROOT, settings: Mapping[str, object] | None = None) -> dict[str, object]:
     try:
         status = tmux_status()
     except (OSError, ValueError, subprocess.TimeoutExpired):
@@ -933,6 +960,8 @@ def process_status(profile: str) -> dict[str, object]:
                 detail = f"{name} window missing; {action}"
         elif window["dead"]:
             state, detail = "exited", f"{name} exited {window['exit_code']}; {action}"
+        elif name == "home-assistant" and not _home_assistant_pane_matches(window, root, settings or DEFAULTS):
+            state, detail = "command", f"home-assistant pane does not match this workspace's HA executable/config or current HA process; {action}"
         elif name != "overview" and Path(window["command"]).name in {"sh", "bash", "zsh", "fish", "dash", "ksh"}:
             state, detail = "command", f"{name} has a shell, not a confirmed service; {action}"
         else:
@@ -957,7 +986,7 @@ def home_assistant_http(settings: Mapping[str, object], *, timeout: float = 2) -
     except urllib.error.HTTPError as error:
         code = error.code
         error.close()
-    except (OSError, ValueError):
+    except (OSError, ValueError, HTTPException):
         pass
     ok = code in {200, 302, 401}
     detail = f"{url} HTTP {code}" if code is not None else f"{url} is unreachable"
@@ -985,7 +1014,7 @@ def frontend_status(root: Path, processes: Mapping[str, object]) -> dict[str, ob
 
 
 def check_default_smoke(root: Path, settings: Mapping[str, object], *, processes=None, packages=None, http=None) -> dict[str, object]:
-    processes = processes if processes is not None else process_status(settings["profile"])
+    processes = processes if processes is not None else process_status(settings["profile"], root=root, settings=settings)
     packages = packages if packages is not None else package_status(root)
     failed = [f"{name}: {item['error']}" for name, item in packages.items() if not item["ok"]]
     inactive = [item["detail"] for item in processes["expected"].values() if item["state"] != "running"]
@@ -1016,13 +1045,17 @@ def toolkit_smoke(root: Path) -> dict[str, object]:
 async def smoke_default(plan: dict[str, object], progress: Progress, *, timeout: float = 60) -> int:
     root = plan["root"]
     settings = {**plan["settings"], "profile": plan.get("profile", plan["settings"]["profile"])}
-    processes = process_status(settings["profile"])
+    processes = process_status(settings["profile"], root=root, settings=settings)
     command = home_assistant_command(root, settings["home_assistant"])
     process = completion = None
     code, stdout, stderr = 1, b"", b""
     start, clock_start = datetime.now(timezone.utc), time.monotonic()
+    unverified_pane = processes["running"] and processes["expected"]["home-assistant"]["state"] != "running"
     try:
-        if processes["running"]:
+        if unverified_pane:
+            http = {**home_assistant_http(settings), "ok": False, "detail": processes["expected"]["home-assistant"]["detail"]}
+            progress.emit("smoke-home-assistant", "error", http["detail"])
+        elif processes["running"]:
             progress.emit("smoke-home-assistant", "running", f"Reusing {TMUX_SESSION}:home-assistant; inspect that pane for output")
         else:
             progress.emit("smoke-home-assistant", "running", f"Starting temporary foreground child: {display_command(command, progress.secrets)}")
@@ -1032,7 +1065,7 @@ async def smoke_default(plan: dict[str, object], progress: Progress, *, timeout:
             )
             completion = asyncio.create_task(process.communicate())
         deadline = time.monotonic() + timeout
-        while True:
+        while not unverified_pane:
             http = await asyncio.to_thread(home_assistant_http, settings, timeout=min(2, max(0.01, deadline - time.monotonic())))
             if process is not None and process.returncode is not None:
                 code = process.returncode or 1
@@ -1232,7 +1265,7 @@ def collect_status(root: Path, settings: Mapping[str, object] | None = None, *, 
             except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
                 state = _empty_repository_status(path, f"Git observation failed; inspect {path}: {error}", "error")
         repositories[name] = {**state, "selected": name in repositories_for(profile), "comparison": "origin default branch from local refs; no fetch"}
-    processes = process_status(profile)
+    processes = process_status(profile, root=root, settings=effective)
     packages = package_status(root)
     packages["knx_frontend"]["frontend"] = frontend_status(root, processes)
     status = {
@@ -1243,7 +1276,7 @@ def collect_status(root: Path, settings: Mapping[str, object] | None = None, *, 
     }
     if profile in {"toolkit", "all"} and smoke is None:
         status["smoke"]["toolkit"] = toolkit_smoke(root)
-    return json.loads(redact(json.dumps(status), secret_values()))
+    return redact_structure(status, secret_values())
 
 
 def render_status(status: Mapping[str, object], format: str = "human", print_fn=print) -> None:
@@ -1835,7 +1868,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return result
 
         status = ensure_repository(Path(argv[1]), argv[2], logged_git)
-        print(redact(json.dumps(status), secret_values()), flush=True)
+        print(json.dumps(redact_structure(status, secret_values())), flush=True)
         return 1 if status["error"] else 0
     try:
         args = build_parser().parse_args(argv)
