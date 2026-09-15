@@ -580,7 +580,7 @@ def test_main_update_processes_exactly_the_selected_profile(
         (tmp_path / name).mkdir()
     attempted: list[str] = []
 
-    def update(path: Path, origin: str) -> dict[str, object]:
+    def update(path: Path, origin: str, runner=None) -> dict[str, object]:
         attempted.append(path.name)
         return repository_result(path)
 
@@ -590,6 +590,7 @@ def test_main_update_processes_exactly_the_selected_profile(
     assert ws.main(["dev", "update", "toolkit", "--progress", "quiet"]) == 0
     assert attempted == list(selected)
     assert "summary" in capsys.readouterr().out
+    assert len(list((tmp_path / ".state/logs").glob("*.log"))) == len(selected)
 
 
 def test_main_update_stops_and_returns_the_first_real_failure(
@@ -600,18 +601,48 @@ def test_main_update_stops_and_returns_the_first_real_failure(
         (tmp_path / name).mkdir()
     attempted: list[str] = []
 
-    def update(path: Path, origin: str) -> dict[str, object]:
+    def update(path: Path, origin: str, runner=None) -> dict[str, object]:
         attempted.append(path.name)
         error = "private-value" if path.name == "xknxproject" else None
+        if error and runner is not None:
+            runner(
+                ["git", "-C", str(path), "fetch", "origin", "--prune"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            runner(
+                ["git", "-C", str(path), "status", "--porcelain=v1"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
         return repository_result(path, error=error)
 
     monkeypatch.setattr(ws, "ROOT", tmp_path)
     monkeypatch.setattr(ws, "ensure_repository", update)
     monkeypatch.setenv("UPDATE_TOKEN", "private-value")
+    calls = iter(
+        (
+            CompletedProcess([], 128, "", "private-value"),
+            CompletedProcess([], 7, "", "later failure"),
+        )
+    )
+    monkeypatch.setattr(ws.subprocess, "run", lambda *args, **kwargs: next(calls))
 
-    assert ws.main(["dev", "update", "default", "--progress", "quiet"]) == 1
+    assert ws.main(["dev", "update", "default", "--progress", "quiet"]) == 128
     assert attempted == list(selected[:3])
     assert "private-value" not in capsys.readouterr().out
+    logs = list((tmp_path / ".state/logs").glob("*.log"))
+    assert len(logs) == 3
+    failure_log = next(path for path in logs if "xknxproject" in path.name).read_text()
+    assert "private-value" not in failure_log
+    assert "***" in failure_log
+    assert "returncode: 128" in failure_log
+    assert "later failure" in failure_log
+    assert 'argv: [["git"' in failure_log
+    assert f"cwd: {tmp_path / 'xknxproject'}" in failure_log
+    assert "versions: {}" in failure_log and "decisions: []" in failure_log
 
 
 def test_main_update_reports_a_missing_checkout_without_cloning(
@@ -619,7 +650,7 @@ def test_main_update_reports_a_missing_checkout_without_cloning(
 ) -> None:
     called = False
 
-    def update(path: Path, origin: str) -> dict[str, object]:
+    def update(path: Path, origin: str, runner=None) -> dict[str, object]:
         nonlocal called
         called = True
         return repository_result(path)
@@ -633,6 +664,40 @@ def test_main_update_reports_a_missing_checkout_without_cloning(
     assert "./bootstrap default" in output.out + output.err
     assert called is False
     assert not (tmp_path / "xknx").exists()
+    logs = list((tmp_path / ".state/logs").glob("*.log"))
+    assert len(logs) == 1
+    log = logs[0].read_text()
+    assert "argv: []" in log
+    assert "returncode: 2" in log
+    assert f"cwd: {tmp_path / 'xknx'}" in log
+    assert "run ./bootstrap default" in log
+
+
+def test_main_update_logs_oserror_and_keeps_the_tty_error_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "xknx"
+    path.mkdir()
+    frames: list[dict[str, tuple[str, str]]] = []
+
+    def unavailable(*args, **kwargs):
+        raise OSError("git unavailable: private-value")
+
+    monkeypatch.setattr(ws, "ROOT", tmp_path)
+    monkeypatch.setattr(ws, "repositories_for", lambda profile: ("xknx",))
+    monkeypatch.setattr(ws, "ensure_repository", unavailable)
+    monkeypatch.setattr(ws.Progress, "_render_tty", lambda self: frames.append(dict(self.rows)))
+    monkeypatch.setenv("UPDATE_TOKEN", "private-value")
+
+    assert ws.main(["dev", "update", "default", "--progress", "tty"]) == 127
+    assert frames[-1]["xknx"][0] == "error"
+    assert "git unavailable" in frames[-1]["xknx"][1]
+    assert "private-value" not in frames[-1]["xknx"][1]
+    assert frames[-1]["update-summary"][0] == "summary"
+    log = next((tmp_path / ".state/logs").glob("*.log")).read_text()
+    assert "returncode: 127" in log
+    assert "private-value" not in log
+    assert "git unavailable: ***" in log
 
 
 @pytest.mark.parametrize(

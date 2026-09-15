@@ -132,9 +132,15 @@ def test_main_update_fast_forwards_an_existing_checkout(
     assert ws.main(["dev", "update", "default", "--progress", "json"]) == 0
     assert git("-C", checkout, "rev-parse", "HEAD").stdout.strip() != old_head
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert [event["task"] for event in events] == ["xknx", "update"]
+    assert [event["task"] for event in events] == ["xknx", "update-summary"]
     assert events[0]["status"] == "success"
     assert events[-1]["status"] == "summary"
+    log = next((tmp_path / ".state/logs").glob("*.log")).read_text()
+    assert f"cwd: {checkout}" in log
+    assert 'argv: [["git", "-C"' in log
+    assert "returncode: 0" in log
+    assert "start:" in log and "end:" in log and "duration:" in log
+    assert "stdout:" in log and "stderr:" in log
 
 
 def test_ensure_repository_clones_the_remote_default_branch(tmp_path: Path) -> None:
@@ -223,6 +229,21 @@ def test_safe_update_reports_fetch_failure_with_the_stable_status_keys(tmp_path:
         "action",
         "error",
     }
+
+
+def test_main_update_returns_and_logs_the_real_fetch_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    origin, _, _ = create_checkout(tmp_path)
+    origin.rename(tmp_path / "unavailable.git")
+    monkeypatch.setattr(ws, "ROOT", tmp_path)
+    monkeypatch.setattr(ws, "repositories_for", lambda profile: ("xknx",))
+    monkeypatch.setitem(ws.REPOSITORIES, "xknx", str(origin))
+
+    assert ws.main(["dev", "update", "default", "--progress", "quiet"]) == 128
+    log = next((tmp_path / ".state/logs").glob("*.log")).read_text()
+    assert "returncode: 128" in log
+    assert '"fetch", "origin", "--prune"' in log
 
 
 def test_safe_update_reports_missing_remote_head_without_guessing(tmp_path: Path) -> None:

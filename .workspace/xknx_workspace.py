@@ -1804,6 +1804,77 @@ def repository_row(status: Mapping[str, object]) -> str:
     )
 
 
+def update_repository(
+    path: Path,
+    origin: str,
+    profile: str,
+    progress: Progress,
+    runner=None,
+) -> tuple[dict[str, object], int]:
+    runner = runner or subprocess.run
+    start, clock_start = datetime.now(timezone.utc), time.monotonic()
+    commands: list[list[str]] = []
+    stdout: list[str] = []
+    stderr: list[str] = []
+    first_failure = 0
+    code = 1
+
+    def recording_runner(command, **kwargs):
+        nonlocal first_failure
+        commands.append(list(command))
+        try:
+            result = runner(command, **kwargs)
+        except OSError as error:
+            first_failure = first_failure or 127
+            stderr.append(str(error))
+            raise
+        stdout.append(result.stdout or "")
+        stderr.append(result.stderr or "")
+        first_failure = first_failure or result.returncode
+        return result
+
+    try:
+        if not path.exists():
+            error = f"checkout is missing; run ./bootstrap {profile}"
+            stderr.append(error)
+            status = _empty_repository_status(path, error, "error")
+            code = 2
+        else:
+            try:
+                status = ensure_repository(path, origin, recording_runner)
+            except OSError as error:
+                status = _empty_repository_status(path, str(error), "error")
+                code = first_failure or 127
+            except Exception as error:
+                status = _empty_repository_status(path, str(error), "error")
+                code = first_failure or 1
+            except KeyboardInterrupt:
+                status = _empty_repository_status(path, "Interrupted", "error")
+                code = 130
+            else:
+                code = (first_failure or 1) if status["error"] else 0
+            if status["error"] and str(status["error"]) not in "".join(stderr):
+                stderr.append(str(status["error"]))
+        return status, code
+    finally:
+        end = datetime.now(timezone.utc)
+        write_task_log(
+            progress.log_dir,
+            f"update-{path.name}",
+            command=commands,
+            cwd=path,
+            stdout="".join(stdout),
+            stderr="".join(stderr),
+            returncode=code,
+            start=start,
+            end=end,
+            duration=time.monotonic() - clock_start,
+            secrets=progress.secrets,
+            versions=progress.versions,
+            decisions=progress.decisions,
+        )
+
+
 def validate_settings_schema(settings: Mapping[str, object]) -> None:
     if set(settings) - {"profile", "home_assistant", "knx"}:
         raise ValueError("root configuration accepts only profile, home_assistant, and knx")
@@ -1928,16 +1999,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             repositories = repositories_for(args.profile)
             for name in repositories:
                 path = ROOT / name
-                if path.exists():
-                    status = ensure_repository(path, REPOSITORIES[name])
-                    failure = 1 if status["error"] else 0
-                else:
-                    status = _empty_repository_status(
-                        path,
-                        f"checkout is missing; run ./bootstrap {args.profile}",
-                        "error",
-                    )
-                    failure = 2
+                status, failure = update_repository(
+                    path,
+                    REPOSITORIES[name],
+                    args.profile,
+                    progress,
+                    subprocess.run,
+                )
                 detail = repository_row(status)
                 if status["error"]:
                     detail += f"; {status['error']}"
@@ -1952,7 +2020,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         except KeyboardInterrupt:
             code = 130
         finally:
-            progress.emit("update", "summary", f"Processed {attempted} repositories; exit code {code}")
+            progress.emit("update-summary", "summary", f"Processed {attempted} repositories; exit code {code}")
             progress.close()
         return code
     if args.dev_command == "stop":
