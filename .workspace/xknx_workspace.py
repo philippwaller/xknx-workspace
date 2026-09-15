@@ -1,8 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
+import platform as platform_module
+import re
+import shlex
+import shutil
+import subprocess
+import sys
 import tomllib
+import urllib.request
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -33,6 +42,405 @@ DEFAULTS = {
     "home_assistant": {"port": 8123, "config_dir": "home-assistant-core/config"},
     "knx": {"mode": "automatic"},
 }
+
+PACKAGE_COMMANDS = {
+    "macos": lambda names: ["brew", "install", *names],
+    "ubuntu": lambda names: ["sudo", "apt-get", "install", "-y", *names],
+    "debian": lambda names: ["sudo", "apt-get", "install", "-y", *names],
+    "wsl-ubuntu": lambda names: ["sudo", "apt-get", "install", "-y", *names],
+    "wsl-debian": lambda names: ["sudo", "apt-get", "install", "-y", *names],
+}
+
+DOCKER_LINKS = {
+    "macos": "https://docs.docker.com/desktop/setup/install/mac-install/",
+    "ubuntu": "https://docs.docker.com/engine/install/ubuntu/",
+    "debian": "https://docs.docker.com/engine/install/debian/",
+    "wsl-ubuntu": "https://docs.docker.com/desktop/features/wsl/",
+    "wsl-debian": "https://docs.docker.com/desktop/features/wsl/",
+}
+
+DOCKER_START_COMMANDS = {
+    "macos": ["open", "-a", "Docker"],
+    "ubuntu": ["sudo", "systemctl", "start", "docker"],
+    "debian": ["sudo", "systemctl", "start", "docker"],
+    "wsl-ubuntu": ["powershell.exe", "-Command", "Start-Process", "Docker Desktop"],
+    "wsl-debian": ["powershell.exe", "-Command", "Start-Process", "Docker Desktop"],
+}
+
+TOOL_LINKS = {
+    "git": "https://git-scm.com/downloads",
+    "uv": "https://docs.astral.sh/uv/getting-started/installation/",
+    "tmux": "https://github.com/tmux/tmux/wiki/Installing",
+}
+
+PACKAGE_SOURCE_LINKS = {
+    "macos": ("homebrew", "https://brew.sh/"),
+    "ubuntu": ("apt", "https://help.ubuntu.com/community/AptGet/Howto"),
+    "debian": ("apt", "https://wiki.debian.org/Apt"),
+    "wsl-ubuntu": ("apt", "https://help.ubuntu.com/community/AptGet/Howto"),
+    "wsl-debian": ("apt", "https://wiki.debian.org/Apt"),
+}
+
+NODE_REPOSITORIES = {"home-assistant-frontend", "knx-frontend", "xknxtoolkit", "home-assistant.io"}
+CONFIRMED_PLAN_ENV = "XKNX_WORKSPACE_CONFIRMED_PLAN"
+CONFIRMED_PLAN_DIGEST_ENV = "XKNX_WORKSPACE_CONFIRMED_PLAN_SHA256"
+
+
+def detect_platform(os_release: str | None = None, uname: str | None = None) -> str:
+    uname = uname if uname is not None else f"{platform_module.system()} {platform_module.release()}"
+    if uname.startswith("Darwin"):
+        return "macos"
+    if not uname.startswith("Linux"):
+        return "unsupported"
+    if os_release is None:
+        try:
+            os_release = Path("/etc/os-release").read_text()
+        except OSError:
+            os_release = ""
+    match = re.search(r"^ID=['\"]?([^'\"\n]+)", os_release, re.MULTILINE)
+    distribution = match.group(1) if match else "unsupported"
+    return f"wsl-{distribution}" if "microsoft" in uname.lower() else distribution
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    match = re.match(r"v?(\d+(?:\.\d+)*)", version)
+    parts = list(map(int, match.group(1).split("."))) if match else []
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def version_decision(tool: str, installed: str | None, expected: str, enforce: bool) -> dict[str, str | None]:
+    if installed is None:
+        return {"action": "install", "relation": "missing", "installed": None, "expected": expected}
+    installed_version, expected_version = _version_tuple(installed), _version_tuple(expected)
+    relation = "current" if installed_version == expected_version else "older" if installed_version < expected_version else "newer"
+    return {
+        "action": "keep" if relation == "current" or not enforce else "replace",
+        "relation": relation,
+        "installed": installed.lstrip("v"),
+        "expected": expected.lstrip("v"),
+    }
+
+
+def missing_tool_actions(
+    platform: str,
+    tools: Mapping[str, str | None],
+    apt_packages: set[str] | None = None,
+    package_source_available: bool = True,
+) -> list[dict[str, object]]:
+    missing = [name for name, executable in tools.items() if executable is None]
+    if not missing:
+        return []
+    if not package_source_available:
+        tool, link = PACKAGE_SOURCE_LINKS[platform]
+        return [{"kind": "manual", "tool": tool, "command": [], "link": link}]
+    available = missing
+    if platform != "macos":
+        if apt_packages is None:
+            apt_packages = set()
+            for name in missing:
+                try:
+                    result = subprocess.run(
+                        ["apt-cache", "show", name], capture_output=True, text=True, check=False
+                    )
+                except OSError:
+                    break
+                if result.returncode == 0:
+                    apt_packages.add(name)
+        available = [name for name in missing if name in apt_packages]
+    actions: list[dict[str, object]] = []
+    if available:
+        actions.append({"kind": "package", "command": PACKAGE_COMMANDS[platform](available)})
+    actions.extend(
+        {"kind": "manual", "tool": name, "command": [], "link": TOOL_LINKS[name]}
+        for name in missing
+        if name not in available
+    )
+    return actions
+
+
+def nvm_install_action(tag: str) -> dict[str, object]:
+    if not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
+        raise ValueError(f"invalid NVM release: {tag}")
+    return {
+        "tool": "nvm",
+        "version": tag[1:],
+        "command": [
+            "sh",
+            "-c",
+            f"curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/{tag}/install.sh | PROFILE=/dev/null bash",
+        ],
+    }
+
+
+def resolve_nvm_release(opener=urllib.request.urlopen) -> str:
+    request = urllib.request.Request(
+        "https://api.github.com/repos/nvm-sh/nvm/releases/latest",
+        headers={"Accept": "application/vnd.github+json"},
+    )
+    with opener(request, timeout=10) as response:
+        tag = json.loads(response.read())["tag_name"]
+    if not isinstance(tag, str) or not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
+        raise ValueError(f"invalid NVM release: {tag}")
+    return tag
+
+
+def nvm_shell(command: list[str]) -> list[str]:
+    quoted = shlex.join(command)
+    return [
+        "bash",
+        "-lc",
+        'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"; '
+        '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; '
+        f"nvm install --silent && nvm use --silent && {quoted}",
+    ]
+
+
+def docker_status(platform: str, executable: str | None, daemon_reachable: bool) -> dict[str, object]:
+    if executable is None:
+        return {
+            "tool": "docker",
+            "level": "warning",
+            "required": False,
+            "available": False,
+            "link": DOCKER_LINKS[platform],
+        }
+    return {
+        "tool": "docker",
+        "level": "ok" if daemon_reachable else "info",
+        "required": False,
+        "available": daemon_reachable,
+        "executable": executable,
+        "link": DOCKER_LINKS[platform],
+        "start_command": None if daemon_reachable else DOCKER_START_COMMANDS[platform],
+    }
+
+
+def package_source_available(platform: str) -> bool:
+    commands = ("brew",) if platform == "macos" else ("apt-cache", "apt-get")
+    return all(shutil.which(command) for command in commands)
+
+
+def inspect_tool(name: str, expectation: str | None = None) -> dict[str, object]:
+    executable = shutil.which(name)
+    command = [executable, "--version"] if executable else None
+    if name == "tmux" and executable:
+        command = [executable, "-V"]
+    elif name == "nvm":
+        nvm_script = Path(os.environ.get("NVM_DIR", Path.home() / ".nvm")) / "nvm.sh"
+        if nvm_script.is_file():
+            executable = str(nvm_script)
+            command = [
+                "bash",
+                "-lc",
+                'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"; . "$NVM_DIR/nvm.sh"; nvm --version',
+            ]
+    installed = None
+    if command:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode == 0 and (match := re.search(r"\d+(?:\.\d+)+", result.stdout or result.stderr)):
+            installed = match.group()
+    status: dict[str, object] = {
+        "kind": "tool",
+        "tool": name,
+        "executable": executable,
+        "installed": installed,
+    }
+    if expectation:
+        status.update(version_decision(name, installed, expectation, enforce=False))
+    return status
+
+
+def inspect_docker(platform: str) -> dict[str, object]:
+    executable = shutil.which("docker")
+    reachable = bool(
+        executable
+        and subprocess.run(
+            [executable, "info"], capture_output=True, text=True, check=False
+        ).returncode
+        == 0
+    )
+    return docker_status(platform, executable, reachable)
+
+
+def docs_prerequisite_actions(root: Path, profile: str) -> list[dict[str, object]]:
+    if profile not in {"docs", "all"}:
+        return []
+    paths = (root / "xknx/docs/.ruby-version", root / "home-assistant.io/.ruby-version")
+    if not all(path.is_file() for path in paths):
+        return [
+            {
+                "kind": "diagnostic",
+                "level": "warning",
+                "scope": "docs",
+                "blocking": True,
+                "message": "Ruby versions will be checked after the documentation repositories are available.",
+            }
+        ]
+    versions = tuple(dict.fromkeys(path.read_text().strip().lstrip("v") for path in paths))
+    expected = versions[0] if len(versions) == 1 else ", ".join(versions)
+    ruby = inspect_tool("ruby", expected if len(versions) == 1 else None)
+    bundler = inspect_tool("bundle")
+    actions: list[dict[str, object]] = []
+    if ruby["installed"] not in versions:
+        actions.append(
+            {
+                "kind": "manual",
+                "tool": "ruby",
+                "command": [],
+                "expected": expected,
+                "scope": "docs",
+                "blocking": True,
+                "link": "https://www.ruby-lang.org/en/documentation/installation/",
+            }
+        )
+    else:
+        actions.append({**ruby, "scope": "docs"})
+    if bundler["executable"] is None:
+        actions.append(
+            {
+                "kind": "manual",
+                "tool": "bundler",
+                "command": [],
+                "scope": "docs",
+                "blocking": True,
+                "link": "https://bundler.io/guides/getting_started.html",
+            }
+        )
+    else:
+        actions.append({**bundler, "scope": "docs"})
+    return actions
+
+
+def build_bootstrap_plan(
+    root: Path,
+    profile: str,
+    settings: dict[str, object],
+    *,
+    enforce_tool_versions: bool = False,
+) -> list[dict[str, object]]:
+    repositories = repositories_for(profile)
+    platform = detect_platform()
+    if platform not in PACKAGE_COMMANDS:
+        raise ValueError(f"unsupported platform: {platform}")
+    plan: list[dict[str, object]] = [
+        {
+            "kind": "context",
+            "platform": platform,
+            "profile": profile,
+            "repositories": repositories,
+            "settings": settings,
+        }
+    ]
+    tool_states = [inspect_tool(name) for name in ("git", "uv", "tmux")]
+    plan.extend(tool_states)
+    plan.extend(
+        missing_tool_actions(
+            platform,
+            {str(item["tool"]): item["executable"] for item in tool_states},
+            package_source_available=package_source_available(platform),
+        )
+    )
+    if NODE_REPOSITORIES.intersection(repositories):
+        nvm = inspect_tool("nvm")
+        plan.append(nvm)
+        if nvm["executable"] is None or enforce_tool_versions:
+            tag = resolve_nvm_release()
+            decision = version_decision(
+                "nvm", nvm["installed"] if isinstance(nvm["installed"], str) else None, tag, enforce_tool_versions
+            )
+            if decision["action"] in {"install", "replace"}:
+                plan.append({"kind": "installer", **nvm_install_action(tag), "decision": decision})
+    plan.append(inspect_docker(platform))
+    plan.extend(docs_prerequisite_actions(root, profile))
+    return plan
+
+
+def _serialized_plan(plan: Sequence[Mapping[str, object]]) -> str:
+    return json.dumps(plan, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def plan_digest(plan: Sequence[Mapping[str, object]]) -> str:
+    return hashlib.sha256(_serialized_plan(plan).encode()).hexdigest()
+
+
+def validate_plan_digest(plan: Sequence[Mapping[str, object]], digest: str) -> None:
+    if plan_digest(plan) != digest:
+        raise ValueError("confirmed plan changed before execution")
+
+
+def render_plan(plan: Sequence[Mapping[str, object]], print_fn=print) -> None:
+    for item in plan:
+        if command := item.get("command"):
+            print_fn(f"$ {shlex.join(command)}")
+        elif item.get("kind") == "context":
+            print_fn(f"Platform: {item['platform']}  Profile: {item['profile']}")
+            print_fn(f"Repositories: {', '.join(item['repositories'])}")
+        elif item.get("level") in {"warning", "info"}:
+            print_fn(f"{str(item['level']).upper()}: {item.get('message') or item.get('link', '')}")
+        elif item.get("kind") == "manual":
+            print_fn(f"MANUAL: install {item['tool']} — {item['link']}")
+
+
+def run_bootstrap(
+    root: Path,
+    profile: str,
+    *,
+    yes: bool,
+    argv: Sequence[str],
+    enforce_tool_versions: bool = False,
+    environ: Mapping[str, str] = os.environ,
+    input_fn=input,
+    runner=subprocess.run,
+    reexec=os.execvpe,
+) -> int:
+    marker = environ.get(CONFIRMED_PLAN_DIGEST_ENV)
+    carried = environ.get(CONFIRMED_PLAN_ENV)
+    if marker or carried:
+        if not marker or not carried:
+            raise ValueError("incomplete confirmed plan marker")
+        validate_plan_digest(json.loads(carried), marker)
+        return 0
+    settings = load_settings(root, environ)
+    plan = build_bootstrap_plan(
+        root, profile, settings, enforce_tool_versions=enforce_tool_versions
+    )
+    render_plan(plan)
+    if not yes and input_fn("Execute this plan? [y/N] ").strip().lower() not in {"y", "yes"}:
+        return 1
+    uv_missing = any(
+        item.get("kind") == "tool" and item.get("tool") == "uv" and item.get("executable") is None
+        for item in plan
+    )
+    uv_will_be_installed = uv_missing and any(
+        item.get("kind") == "package" and "uv" in item.get("command", ())
+        for item in plan
+    )
+    for item in plan:
+        if item.get("kind") not in {"package", "installer"} or not item.get("command"):
+            continue
+        result = runner(item["command"], check=False)
+        if result.returncode:
+            return int(result.returncode)
+    if any(item.get("kind") == "manual" and "scope" not in item for item in plan):
+        return 2
+    if uv_will_be_installed:
+        child_environ = dict(environ)
+        child_environ[CONFIRMED_PLAN_ENV] = _serialized_plan(plan)
+        child_environ[CONFIRMED_PLAN_DIGEST_ENV] = plan_digest(plan)
+        command = [
+            shutil.which("uv") or "uv",
+            "run",
+            "--project",
+            str(root / ".workspace"),
+            "--locked",
+            "python",
+            str(Path(__file__).resolve()),
+            *argv,
+        ]
+        reexec(command[0], command, child_environ)
+    return 0
 
 
 def repositories_for(profile: str) -> tuple[str, ...]:
@@ -82,9 +490,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     try:
-        build_parser().parse_args(argv)
+        args = build_parser().parse_args(argv)
     except SystemExit as error:
         return int(error.code)
+    if args.command == "bootstrap":
+        try:
+            return run_bootstrap(
+                ROOT,
+                args.profile,
+                yes=args.yes,
+                argv=list(argv) if argv is not None else sys.argv[1:],
+                enforce_tool_versions=args.enforce_tool_versions,
+            )
+        except (KeyError, OSError, ValueError) as error:
+            print(f"Error: {error}", file=sys.stderr)
+            return 2
     return 0
 
 
