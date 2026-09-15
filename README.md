@@ -59,6 +59,12 @@ displayed plan is intentional. A failed or interrupted run is resumed by
 running the same bootstrap command again; completed results are reused, so
 there is no separate reset or resume command.
 
+Standalone status reports readiness but leaves smoke as `not-run`; the public
+smoke path runs as part of bootstrap. Do not rerun bootstrap solely for an
+unrequested smoke result because it may fetch or safely update repositories.
+Status uses the profile configured in root `.xknx-dev.toml`, so align that file
+with the intended profile before claiming its readiness.
+
 ## Commands
 
 ```sh
@@ -82,8 +88,12 @@ windows. Common controls are:
 - `Ctrl-b w`: choose a window.
 - `Ctrl-b d`: detach while leaving processes running.
 - `Ctrl-C`: stop the foreground process in the selected pane.
-- To restart one process, stop it with `Ctrl-C` and rerun that repository's
-  normal development command in the same visible pane.
+- For panes other than Home Assistant, restart by stopping the process with
+  `Ctrl-C` and rerunning that repository's normal command in the visible pane.
+- Do not rerun the Home Assistant pane command; that bypasses the workspace's
+  lifecycle identity. Inspect it without restarting, or, only after the
+  developer chooses, restart the whole session with `./dev stop` and then
+  `./dev start <profile>`. Never stop or restart it automatically.
 - `./dev start <profile>` or `tmux attach -t xknx-dev`: attach again.
 - `./dev stop`: terminate the entire session.
 

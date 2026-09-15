@@ -33,10 +33,21 @@ class FakeResponse(BytesIO):
 def test_documentation_and_skill_contract(workspace_root: Path) -> None:
     skill = workspace_root / ".agents/skills/bootstrap-xknx-workspace/SKILL.md"
     metadata = workspace_root / ".agents/skills/bootstrap-xknx-workspace/agents/openai.yaml"
+    readme = workspace_root / "README.md"
     assert skill.exists() and metadata.exists()
-    assert "name: bootstrap-xknx-workspace" in skill.read_text()
-    assert "./dev status --format json" in skill.read_text()
-    assert "./bootstrap" in skill.read_text()
+    skill_text = skill.read_text()
+    readme_text = readme.read_text()
+    skill_words = " ".join(skill_text.split())
+    readme_words = " ".join(readme_text.split())
+    assert "name: bootstrap-xknx-workspace" in skill_text
+    assert "./dev status --format json" in skill_text
+    assert "./bootstrap" in skill_text
+    assert "Compare the requested profile with JSON `profile`" in skill_words
+    assert "do not claim requested-profile readiness" in skill_words
+    assert "Do not run bootstrap solely to produce a smoke result" in skill_words
+    assert "report smoke as `not-run`" in skill_words
+    assert "Do not rerun the Home Assistant pane command" in readme_words
+    assert "./dev stop` and then `./dev start <profile>" in readme_words
     assert 'display_name: "Bootstrap XKNX Workspace"' in metadata.read_text()
 
 
