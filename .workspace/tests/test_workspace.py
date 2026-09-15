@@ -12,6 +12,11 @@ import pytest
 import xknx_workspace as ws
 
 
+@pytest.fixture
+def workspace_root() -> Path:
+    return Path(__file__).parents[2]
+
+
 class FakeResponse(BytesIO):
     def __init__(
         self,
@@ -23,6 +28,16 @@ class FakeResponse(BytesIO):
 
     def geturl(self) -> str:
         return self.url
+
+
+def test_documentation_and_skill_contract(workspace_root: Path) -> None:
+    skill = workspace_root / ".agents/skills/bootstrap-xknx-workspace/SKILL.md"
+    metadata = workspace_root / ".agents/skills/bootstrap-xknx-workspace/agents/openai.yaml"
+    assert skill.exists() and metadata.exists()
+    assert "name: bootstrap-xknx-workspace" in skill.read_text()
+    assert "./dev status --format json" in skill.read_text()
+    assert "./bootstrap" in skill.read_text()
+    assert 'display_name: "Bootstrap XKNX Workspace"' in metadata.read_text()
 
 
 def test_default_profile_contains_the_complete_ha_knx_stack() -> None:

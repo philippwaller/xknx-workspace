@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bootstrap XKNX Workspace"
+  short_description: "Start and verify the local XKNX workspace"
+  default_prompt: "Use $bootstrap-xknx-workspace to bootstrap or inspect this workspace, keep processes visible, and verify the selected profile."
