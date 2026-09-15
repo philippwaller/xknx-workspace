@@ -81,6 +81,18 @@ def workspace_root() -> Path:
     return Path(__file__).parents[2]
 
 
+def test_first_run_docs_match_the_locked_rich_bootstrap(workspace_root: Path) -> None:
+    readme = (workspace_root / "README.md").read_text()
+    agents = (workspace_root / "AGENTS.md").read_text()
+    assert "Git 2.39" in readme and "Python 3.12" in readme
+    assert "uv 0.8.17" in readme and "tmux 3.2" in readme and "NVM" in readme
+    assert "never installs" in readme
+    assert ".workspace/uv.lock" in readme
+    assert "first interactive" in readme and "Rich" in readme
+    assert "./bootstrap" in agents and "never installs" in agents
+    assert "plain progress remains usable without Rich" not in agents
+
+
 def test_automation_covers_uv_actions_and_two_smoke_platforms(workspace_root: Path) -> None:
     dependabot = (workspace_root / ".github/dependabot.yml").read_text()
     ci = (workspace_root / ".github/workflows/ci.yml").read_text()

@@ -35,9 +35,16 @@ them.
 - Root `.xknx-dev.toml` owns local workspace selection. Child setup scripts,
   version files, manifests, and lockfiles remain authoritative for each
   project.
-- Launchers use an existing Python 3.12+ directly. Bootstrap creates a missing
-  CLI environment only as a displayed, confirmed action. Daily commands and
-  help never synchronize it; plain progress remains usable without Rich.
+- Required global prerequisites are Git >= 2.39, Python >= 3.12, uv >= 0.8.17,
+  tmux >= 3.2, and NVM. Bootstrap never installs, upgrades, or downgrades
+  them; missing or incompatible tools block setup with actionable guidance.
+- `./bootstrap` uses the prerequisite Python and uv to synchronize the locked
+  `.workspace/uv.lock` environment before launching its CLI. This controller
+  preparation is the only pre-confirmation mutation, and the first interactive
+  bootstrap screen is Rich. Daily `./dev` commands and help never synchronize
+  the controller environment; if it is missing, run `./bootstrap` first.
+- The default interactive plan hides raw commands; use `--verbose` to reveal
+  them. Plain and JSON modes remain available for diagnostics.
 - Real KNX `secure_config_path` is a local file reference, not an installed
   Home Assistant integration configuration. The developer configures that
   integration explicitly; never copy or print the referenced secret material.

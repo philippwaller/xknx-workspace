@@ -51,33 +51,41 @@ From the workspace root:
 ./dev start default
 ```
 
-Bootstrap first prints the complete plan: platform and tools, repositories,
-project-owned setup commands, configuration, editable package wiring, and
-smoke checks. It changes nothing until the single confirmation is accepted.
-Use `./bootstrap default --yes` only when non-interactive acceptance of that
+Bootstrap requires these existing global prerequisites:
+
+- Git 2.39.0 or newer
+- Python 3.12 or newer
+- uv 0.8.17 or newer
+- tmux 3.2 or newer
+- NVM, with no workspace-wide exact version constraint
+
+Bootstrap never installs, upgrades, or downgrades them. Missing or incompatible
+tools stop setup before any project checkout or configuration change and print
+platform-specific installation guidance; update them explicitly. These are
+minimums, not exact package-manager pins.
+
+On `./bootstrap`, the launcher uses the prerequisite Python and uv to prepare
+`.workspace/.venv` from `.workspace/uv.lock` with locked, no-dev,
+no-Python-download settings, then starts the CLI from that environment. This
+controller-environment preparation is the only mutation allowed before the
+single confirmation. A short native preloader message may appear while Rich is
+prepared, but the first interactive bootstrap screen is always Rich. If
+preparation fails, fix the reported prerequisite and rerun `./bootstrap`.
+
+The default interactive plan describes intent and current state without raw
+shell commands. Use `./bootstrap default --verbose` to reveal exact commands;
+logs, plain progress, and JSON remain available for full diagnostics. Use
+`./bootstrap default --yes` only when non-interactive acceptance of the
 displayed plan is intentional. A failed or interrupted run is resumed by
 running the same bootstrap command again. Environments are reused; the KNX
 frontend runs its own idempotent bootstrap and build every time so old build
 files cannot hide source or dependency changes.
 
-The launchers require an existing Python 3.12+ and never synchronize or download
-anything before confirmation, including for `--help` and daily `dev` commands.
-They ignore inherited `UV_PROJECT_ENVIRONMENT` and `VIRTUAL_ENV`. If Python is too
-old, they print the matching Homebrew/APT command or the official Python link.
-Global minimum versions are Git 2.39.0, uv 0.8.17, and tmux 3.2. Older installed
-tools block setup and remain untouched; update them explicitly. These are
-minimums, not exact package-manager pins, even with `--enforce-tool-versions`.
-
-A fresh run uses complete plain progress when Rich is unavailable. If the root
-CLI environment is missing, the plan includes its locked setup after tool
-installation and the normal confirmation, using the current Python without
-downloading another interpreter. Later runs automatically use that environment
-and its interactive renderer; there is no extra setup command or confirmation.
-An existing root CLI environment is left untouched.
-
-Frontend subprocesses select their project's Node through NVM and enable Yarn
-through that Node installation's Corepack. The project declarations select
-Yarn's version; no global Yarn installation or parent-shell change is needed.
+Daily `./dev` commands never synchronize the controller environment. If it is
+missing, run `./bootstrap` first. The launchers ignore inherited
+`UV_PROJECT_ENVIRONMENT` and `VIRTUAL_ENV`. Frontend subprocesses select their
+project's Node through NVM and enable Yarn through that Node installation's
+Corepack; no global Yarn installation or parent-shell change is needed.
 
 Standalone status reports readiness but leaves smoke as `not-run`; the public
 smoke path runs as part of bootstrap. Do not rerun bootstrap solely for an
