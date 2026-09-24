@@ -680,7 +680,7 @@ def nvm_shell(command: list[str]) -> list[str]:
         "-lc",
         'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"; '
         '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; '
-        'nvm install --silent && nvm use --silent && "$NVM_BIN/corepack" enable yarn && ' + quoted,
+        'nvm install && nvm use --silent && "$NVM_BIN/corepack" enable yarn && ' + quoted,
     ]
 
 

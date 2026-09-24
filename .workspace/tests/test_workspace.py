@@ -391,7 +391,7 @@ def test_nvm_shell_sources_nvm_only_for_the_child_command() -> None:
         "-lc",
         'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"; '
         '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; '
-        'nvm install --silent && nvm use --silent && "$NVM_BIN/corepack" enable yarn && npm run \'build docs\'',
+        'nvm install && nvm use --silent && "$NVM_BIN/corepack" enable yarn && npm run \'build docs\'',
     ]
 
 
