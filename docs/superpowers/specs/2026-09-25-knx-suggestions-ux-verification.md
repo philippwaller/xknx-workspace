@@ -36,6 +36,14 @@ Responsive Prüfung: 390×844 (dunkel), 768×1024 und 1280×720 (hell), native V
 
 Eine zusätzliche Browser-Regressionsprüfung zeigte die falsche anfängliche Anzeige nativer Auswahlfelder. Explizite Auswahl an den Optionen korrigiert die bestehende Geräte-, Bereichs- und Etagenzuordnung sowie Kategorie und Filter; zwei Tests reproduzierten den Fehler vor der Korrektur.
 
-Abschluss: Produktionsbuild erfolgreich (letzter Build `entrypoint.38ad0763274181ef.js`). Bestehende Gerätezuordnung zusätzlich im Browser nach dem finalen Build korrekt verifiziert. Temporär ersetzte generierte Laufzeitdateien vollständig aus dem Originalbackup wiederhergestellt und mit `diff -qr` identisch geprüft; temporäre Browser-Overrides zurückgesetzt. Original-Quellcodediff bytegleich zum gesicherten Ausgangsstand. Die neue Oberfläche liegt im separaten Worktree und ist noch nicht dauerhaft in den laufenden Checkout integriert.
+Abschluss: Produktionsbuild erfolgreich (letzter Build `entrypoint.38ad0763274181ef.js`). Bestehende Gerätezuordnung zusätzlich im Browser nach dem finalen Build korrekt verifiziert. Temporär ersetzte generierte Laufzeitdateien vollständig aus dem Originalbackup wiederhergestellt und mit `diff -qr` identisch geprüft; temporäre Browser-Overrides zurückgesetzt. Original-Quellcodediff bytegleich zum gesicherten Ausgangsstand. Die neue Oberfläche wurde anschließend nach ausdrücklicher Nutzerfreigabe lokal in den ursprünglichen Frontend-Branch integriert (siehe unten).
 
 Frontend-Commits: `742a5f5`, `efaa2ce`, `2313e51`. Die sechs bereits vorher veränderten Dateien bleiben mit ihren ursprünglichen 72 Ergänzungen und 2 Löschungen uncommitted; sie wurden nicht in diese Commits aufgenommen.
+
+## Lokale Integration
+
+Auf Nutzerwahl „1“ wurde `feature/knx-project-suggestions-frontend` per `git merge --ff-only` von `83d2b71` auf `2313e51` aktualisiert. Drei überlappende lokale Dateien wurden als Patch und vollständige Dateien separat gesichert, während des Fast-forwards ausgenommen und danach wieder eingespielt; kein Stash, Reset, Push oder Branchwechsel. Der vollständige lokale Diff entspricht bytegenau dem bereits geprüften Worktree (sechs Dateien, 72 Ergänzungen, 2 Löschungen).
+
+Nach Integration: erneut 32 Testdateien / 372 Tests bestanden; `git diff --check` sauber. Die generierten Laufzeitdateien wurden durch diesen Integrationsschritt nicht neu gebaut oder ausgetauscht.
+
+Der Hilfs-Worktree und dessen Branch bleiben erhalten: `git worktree remove` verweigert die Entfernung mit „working trees containing submodules cannot be moved or removed“. Keine erzwungene Löschung.
