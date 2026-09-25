@@ -1,6 +1,6 @@
 # Kosteneffizienter ETS-Import mit konsistenten logischen KNX-Geräten
 
-- Status: Architekturgrundsatz im Gespräch bestätigt; schriftliche Spezifikation zur Prüfung.
+- Status: Schriftliche Spezifikation am 2026-09-25 vom Nutzer freigegeben; Implementierungsplanung autorisiert.
 - Datum: 2026-09-25.
 - Verantwortlicher Bereich: KNX Suggestions in Home Assistant Core; KNX Frontend für Darstellung und Startoptionen.
 - Ausgangspunkt: [KNX project suggestions](2026-09-24-knx-project-suggestions-design.md).
